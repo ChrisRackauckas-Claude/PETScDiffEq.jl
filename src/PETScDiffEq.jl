@@ -2901,7 +2901,8 @@ function _check_inttype(petsclib)
     return nothing
 end
 
-_maxsteps(maxiters) = LibPETSc.PetscInt(min(maxiters, typemax(LibPETSc.PetscInt)))
+# TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
+_maxsteps(maxiters) = LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
 
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
@@ -3210,6 +3211,8 @@ _check_real_tol(tol, name) = _check_real(tol, name; accept = isreal)
 
 function _check_tol(tol, n, name)
     _check_real_tol(tol, name)
+    # TSSetTolerances reads -1 and -2 as PETSC_DETERMINE and PETSC_CURRENT.
+    tol isa Number && real(tol) < 0 && throw(ArgumentError("`$name` is negative"))
     tol isa AbstractVector || return nothing
     length(tol) == n ||
         throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
@@ -4073,6 +4076,8 @@ function _setup(
             )
             _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
             effective_options = ["-ts_error_if_step_fails", "false"]
+            # TSSetMaxTime reads -1 as PETSC_DETERMINE; the option is stored as given.
+            tf == -1 && push!(effective_options, "-ts_max_time=-1")
             append!(effective_options, _default_options(alg))
             # PETSc's sparse LU does not pivot, and an algebraic row has a zero diagonal.
             if h.jac_mat !== nothing && (uses_sparse_jac || dm_jac) || h.fd_mat !== nothing
@@ -5701,7 +5706,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     # PETSc keeps the step shortened onto its max time, so `dtcache` holds the uncut one.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
-    LibPETSc.TSSetMaxTime(pl, h.ts, target)
+    # TSSetMaxTime reads -1 as PETSC_DETERMINE; the step is cut to the target below.
+    LibPETSc.TSSetMaxTime(pl, h.ts, target == -1 ? nextfloat(target) : target)
     if h.matches
         _match_step!(integ, target - integ.tdir * integ.t)
     elseif LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
