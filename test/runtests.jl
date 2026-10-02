@@ -151,22 +151,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.15), orders)
     end
 
-    @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
-        # PETSc evaluates an explicit first stage at stale stage_time==0 on steprestart;
-        # the package runs that clock from 0 so the stale value is the correct start.
+    @testset "TSARKIMEX refuses an explicit first stage when tspan starts away from 0" begin
         f!(du, u, p, t) = (du[1] = cos(t); nothing)
         t0 = 1.0
         prob = SciMLBase.ODEProblem(f!, [sin(t0)], (t0, t0 + 1))
-        sol = SciMLBase.solve(
-            prob, PETScDiffEq.TSARKIMEX("3"); dt = 0.01, adaptive = false,
+        msg = "tspan starts away from 0"
+        for alg in (
+                PETScDiffEq.TSARKIMEX("3"),
+                PETScDiffEq.TSARKIMEX("l2", ["-ts_arkimex_type", "3"]),
+                PETScDiffEq.TSGeneric("arkimex", ["-ts_arkimex_type", "3"]),
+            )
+            @test_throws msg SciMLBase.solve(prob, alg; dt = 0.01, adaptive = false)
+            @test_throws msg SciMLBase.init(prob, alg; dt = 0.01, adaptive = false)
+        end
+        for alg in (
+                PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "l2"]),
+                PETScDiffEq.TSARKIMEX("l2"),
+            )
+            sol = SciMLBase.solve(prob, alg; dt = 0.01, adaptive = false)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][1] - sin(t0 + 1)) < 1.0e-6
+        end
+        from0 = SciMLBase.ODEProblem(f!, [0.0], (0.0, 1.0))
+        sol0 = SciMLBase.solve(from0, PETScDiffEq.TSARKIMEX("3"); dt = 0.01, adaptive = false)
+        @test sol0.retcode == SciMLBase.ReturnCode.Success
+        @test abs(sol0.u[end][1] - sin(1.0)) < 1.0e-6
+        split = SciMLBase.SplitODEProblem(
+            (du, u, p, t) -> (du[1] = cos(t); nothing),
+            (du, u, p, t) -> (du[1] = 0; nothing),
+            [sin(t0)], (t0, t0 + 1),
         )
-        @test sol.retcode == SciMLBase.ReturnCode.Success
-        @test abs(sol.u[end][1] - sin(t0 + 1)) < 1.0e-6
-        half = SciMLBase.solve(
-            prob, PETScDiffEq.TSARKIMEX("3"); dt = 0.005, adaptive = false,
+        split_sol = SciMLBase.solve(
+            split, PETScDiffEq.TSARKIMEX("3"); dt = 0.01, adaptive = false,
         )
-        @test abs(half.u[end][1] - sin(t0 + 1)) <
-            0.3 * abs(sol.u[end][1] - sin(t0 + 1))
+        @test split_sol.retcode == SciMLBase.ReturnCode.Success
+        @test abs(split_sol.u[end][1] - sin(t0 + 1)) < 1.0e-6
     end
 
     @testset "TSARKIMEX IMEX split" begin
@@ -774,7 +793,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @testset "steps the single-precision clock can take" begin
             if single_build
                 implicit = (
-                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX("3"),
+                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX("l2"),
                 )
                 for t0 in (1.0f4, 1.0f5), alg in implicit
                     sol = SciMLBase.solve(SciMLBase.ODEProblem(decay!, Float32[1], (t0, t0 + 10)), alg)
@@ -5797,6 +5816,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 PETScDiffEq.TSImplicit("bdf"),
             )
             for alg in cubic, (prob, want, _) in spans
+                # Explicit-first-stage ARKIMEX is refused when tspan starts away from 0.
+                alg isa PETScDiffEq.TSARKIMEX && !iszero(first(prob.tspan)) && continue
                 @test matches_petsc(prob, alg)
                 kw = (; fixed..., saveat = want, inner...)
                 @test SciMLBase.solve(prob, alg; kw...).u ==
@@ -5834,6 +5855,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 st in skip || push!(algs, family(st))
             end
             for alg in algs, (prob, want, level) in spans
+                # Default arkimex has an explicit first stage; refuse when tspan starts away from 0.
+                alg isa PETScDiffEq.TSGeneric && alg.ts_type == "arkimex" &&
+                    !iszero(first(prob.tspan)) && continue
                 dense = SciMLBase.solve(prob, alg; fixed...)
                 expected = [dense(t) for t in want]
                 kw = (; fixed..., saveat = want, inner...)
@@ -5882,7 +5906,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             back_want = [0.85, 0.55, 0.25]
             driven_algs = (
                 PETScDiffEq.TSRK("4"), PETScDiffEq.TSRosW("2m"), PETScDiffEq.TSIRK(2),
-                PETScDiffEq.TSARKIMEX("3"),
+                PETScDiffEq.TSARKIMEX("l2"),
             )
             for alg in driven_algs
                 dense = SciMLBase.solve(back, alg; fixed...)
@@ -7648,7 +7672,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (PETScDiffEq.TSRK("5dp"), (reltol = 1.0e-8, abstol = 1.0e-10)),
                     (PETScDiffEq.TSRosW("ra34pw2"), (reltol = 1.0e-8, abstol = 1.0e-10)),
                     (PETScDiffEq.TSImplicit("bdf"), (reltol = 1.0e-8, abstol = 1.0e-10)),
-                    (PETScDiffEq.TSARKIMEX("3"), (reltol = 1.0e-8, abstol = 1.0e-10)),
+                    (PETScDiffEq.TSARKIMEX("l2"), (reltol = 1.0e-8, abstol = 1.0e-10)),
                     (PETScDiffEq.TSRK("3bs"), (adaptive = false,)),
                 )
                 b = SciMLBase.solve(back, alg; dt = 0.1, kw...)
