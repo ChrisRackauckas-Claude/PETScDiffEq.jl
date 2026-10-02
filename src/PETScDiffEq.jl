@@ -320,6 +320,11 @@ implicit.
 `"bpr3"` is refused on a `SplitODEProblem`, where it converges at first order. On a
 plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3.
 
+On a plain `ODEProblem`, every type but `"1bee"`, `"l2"` and `"prssp2"` has an explicit
+first stage that PETSc evaluates at a stale time on the first step when `tspan` starts
+away from 0, so those configurations are refused. A `SplitODEProblem` has no such limit.
+The refusal follows the type PETSc runs after `petsc_options`, not only the constructor.
+
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
@@ -621,7 +626,7 @@ const _RK_NO_ESTIMATE = ("1fe", "2b", "3", "4")
 const _ROSW_NO_ESTIMATE = ("theta1", "theta2")
 const _ARKIMEX_NO_ESTIMATE = ("prssp2", "ars443", "bpr3")
 # Types whose first stage is implicit; the rest evaluate an explicit first stage at a
-# stale time on the first step after a restart unless PETSc's clock starts at 0.
+# stale time on the first step after a restart when the span does not start at 0.
 const _ARKIMEX_IMPLICIT_FIRST_STAGE = ("1bee", "l2", "prssp2")
 
 function _adapts(name::AbstractString)
@@ -785,8 +790,6 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     maxiters::Int
     linear::Bool
     mass_mat::Any
-    # PETSc clock offset: callbacks see `t + t_shift`, and TS times are stored as `s - t_shift`.
-    t_shift::R
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -1257,7 +1260,7 @@ function _post_step_serial!(ctx, ts)
             u = _read_state!(ctx.u, ctx, flat)
             ctx.partitioned_u === nothing || (u = copyto!(ctx.partitioned_u, u))
             ctx.unstable !== nothing &&
-                ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, _logical_t(ctx, s))) &&
+                ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
                 (ctx.unstable_hit = stop = true)
             ctx.halt_nonfinite && !all(isfinite, u) && (stop = true)
         end
@@ -1290,7 +1293,7 @@ function _post_step_collective!(ctx, ts_ptr)
                 u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
                 if ctx.unstable !== nothing
                     unstable = _asked(ctx) do
-                        ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, _logical_t(ctx, s)))
+                        ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
                     end
                 end
                 nonfinite = ctx.halt_nonfinite && !all(isfinite, u)
@@ -1639,7 +1642,7 @@ function _check_stage_body!(ctx, ts_ptr, t::R, y, accept) where {R}
             unsafe_store!(Ptr{UInt8}(accept), 0x00)
             ctx.unstable_hit = true
             ctx.stuck = "its step fell below the floating point spacing at t = " *
-                "$(_user_t(ctx.tdir, _logical_t(ctx, s)))"
+                "$(_user_t(ctx.tdir, s))"
             LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_DIVERGED_STEP_REJECTED)
             return LibPETSc.PetscErrorCode(0)
         end
@@ -1663,7 +1666,7 @@ function _check_stage_body!(ctx, ts_ptr, t::R, y, accept) where {R}
             ctx.unstable_hit = true
         elseif ctx.dtmin > 0 && next < ctx.dtmin
             ctx.dt_too_small = true
-        elseif next < 100 * eps(max(abs(_logical_t(ctx, s)), ctx.tbound))
+        elseif next < 100 * eps(max(abs(s), ctx.tbound))
             ctx.unstable_hit = true
         elseif next < h
             return LibPETSc.PetscErrorCode(0)
@@ -1867,7 +1870,6 @@ end
 
 function _petsc_interpolate!(ctx, ts, s)
     pl = ctx.petsclib
-    s = _petsc_t(ctx, s)
     ctx.interpolates === false && return nothing
     ctx.interpolates === true && (LibPETSc.TSInterpolate(pl, ts, s, ctx.work); return ctx.work)
     # PETSc prints a traceback before refusing, so ask with printing off. Some types
@@ -2178,16 +2180,6 @@ end
 # `+ zero(s)` turns -0.0 into 0.0, which `isless` would otherwise put before 0.0.
 _user_t(tdir, s) = tdir * s + zero(s)
 
-# PETSc ARKIMEX evaluates an explicit first stage at stale `stage_time == 0` on a steprestart.
-# Running its clock from 0 makes that stale value correct; `t_shift` maps back to problem time.
-_logical_t(ctx::TSContext, s) = s + ctx.t_shift
-_petsc_t(ctx::TSContext, s) = s - ctx.t_shift
-# PETSc reads MaxTime == -1 as DETERMINE; only an unshifted clock may pass that sentinel.
-_petsc_max_time(ctx::TSContext, t) = t == -1 && iszero(ctx.t_shift) ? t : _petsc_t(ctx, t)
-_needs_arkimex_t_shift(alg, is_split, t0) =
-    alg isa TSARKIMEX && !is_split && !(alg.subtype in _ARKIMEX_IMPLICIT_FIRST_STAGE) &&
-    !iszero(t0)
-
 _copy_jac!(J::AbstractMatrix, A) = (copyto!(J, A); nothing)
 
 function _setstored!(J::SparseMatrixCSC, i, j, v)
@@ -2254,7 +2246,6 @@ end
 
 function _rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
-    t = _logical_t(ctx, t)
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         _call_f!(ctx, ctx.du, ctx.u, t)
@@ -2280,7 +2271,6 @@ end
 
 function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
-    t = _logical_t(ctx, t)
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         _call!(ctx.f2!, ctx, ctx.du, ctx.u, ctx.p, t)
@@ -2307,7 +2297,6 @@ end
 
 function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
-    t = _logical_t(ctx, t)
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         udot = _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
@@ -2338,7 +2327,6 @@ end
 
 function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
     pl = ctx.petsclib
-    t = _logical_t(ctx, t)
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         if !_everywhere(ctx.comm, ctx.part_valid && ctx.part_t == t && ctx.part_u == ctx.u)
@@ -2477,7 +2465,6 @@ end
 
 function _i2function_body!(ctx, t, u_ptr, v_ptr, a_ptr, f_ptr)
     pl = ctx.petsclib
-    t = _logical_t(ctx, t)
     try
         nv = _read_second_order!(ctx, u_ptr, v_ptr)
         a = _readvec!(view(ctx.mudot, 1:nv), pl, PETSc.VecPtr(pl, a_ptr, false))
@@ -2536,7 +2523,6 @@ end
 function _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
-    t = _logical_t(ctx, t)
     try
         nv = _read_second_order!(ctx, u_ptr, v_ptr)
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
@@ -2569,7 +2555,6 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
-    t = _logical_t(ctx, t)
     try
         _readvec!(ctx.u, ctx.petsclib, x)
         _call_jac!(ctx, xdot_ptr, shift, t)
@@ -2609,7 +2594,6 @@ function _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     pl = ctx.petsclib
     A = LibPETSc.PetscMat(A_ptr, pl)
     B = LibPETSc.PetscMat(B_ptr, pl)
-    t = _logical_t(ctx, t)
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         _mat_zero!(pl, B)
@@ -2664,7 +2648,6 @@ function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
-    t = _logical_t(ctx, t)
     try
         _readvec!(ctx.u, ctx.petsclib, x)
         if ctx.coo === nothing
@@ -2701,7 +2684,6 @@ end
 function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     x = ctx.flat_vec === nothing ? PETSc.VecPtr(ctx.petsclib, x_ptr, false) : ctx.flat_vec
-    t = _logical_t(ctx, t)
     try
         (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
             _hold_work_vec!(ctx, ts_ptr)
@@ -2715,7 +2697,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
                 landed = true
             elseif ctx.hermite
                 # -ts_exact_final_time interpolate steps past tf and reports tf later.
-                tmax = _logical_t(ctx, LibPETSc.TSGetMaxTime(ctx.petsclib, ts))
+                tmax = LibPETSc.TSGetMaxTime(ctx.petsclib, ts)
                 want >= tmax - tol && t > tmax + tol && break
                 u1 = _read_state!(ctx.u, ctx, x)
                 _record!(
@@ -3071,6 +3053,23 @@ function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
         )
     end
     return nothing
+end
+
+function _refuse_arkimex_stale_stage(name, is_split, t0)
+    startswith(name, "arkimex ") || return nothing
+    is_split && return nothing
+    iszero(t0) && return nothing
+    sub = last(split(name))
+    sub in _ARKIMEX_IMPLICIT_FIRST_STAGE && return nothing
+    throw(
+        ArgumentError(
+            "PETScDiffEq does not support TSARKIMEX(\"$sub\") on an ODEProblem whose " *
+                "tspan starts away from 0: PETSc's arkimex evaluates this type's explicit " *
+                "first stage at a stale time (0) on the first step after a restart; " *
+                "start tspan at 0, use a SplitODEProblem, or use \"1bee\", \"l2\" or " *
+                "\"prssp2\", whose first stage is implicit",
+        ),
+    )
 end
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
@@ -3972,7 +3971,6 @@ function _setup(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
         false, false, Int(maxiters), false, nothing,
-        _needs_arkimex_t_shift(alg, is_split, t0) ? t0 : zero(R),
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -4094,9 +4092,9 @@ function _setup(
                 _colour_jacobian!(petsclib, ts, h.fd_mat)
             end
             LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
-            LibPETSc.TSSetTime(petsclib, ts, _petsc_t(ctx, t0))
+            LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
-            LibPETSc.TSSetMaxTime(petsclib, ts, _petsc_max_time(ctx, tf))
+            LibPETSc.TSSetMaxTime(petsclib, ts, tf)
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
@@ -4104,7 +4102,7 @@ function _setup(
             _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
             effective_options = ["-ts_error_if_step_fails", "false"]
             # TSSetMaxTime reads -1 as PETSC_DETERMINE; the option is stored as given.
-            tf == -1 && iszero(ctx.t_shift) && push!(effective_options, "-ts_max_time=-1")
+            tf == -1 && push!(effective_options, "-ts_max_time=-1")
             append!(effective_options, _default_options(alg))
             # PETSc's sparse LU does not pivot, and an algebraic row has a zero diagonal.
             if h.jac_mat !== nothing && (uses_sparse_jac || dm_jac) || h.fd_mat !== nothing
@@ -4179,6 +4177,9 @@ function _setup(
             comm === nothing || chosen != "irk" || _check_irk_layout(n, N, comm)
             running = _running_name(petsclib, ts)
             _refuse_method(running, has_mass, has_jac, is_split, is_dae)
+            _checked_everywhere(comm) do
+                _refuse_arkimex_stale_stage(running, is_split, t0)
+            end
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETScCompat.destroy!(h.jac_mat)
@@ -4460,10 +4461,7 @@ function _solve_unlocked(
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
         # raises leaves its rejected trial in the solution vector.
         tend, uend = raised || ctx.stalled ? (ctx.end_s, copy(ctx.end_u)) :
-            (
-            _logical_t(ctx, LibPETSc.TSGetSolveTime(pl, h.ts)),
-            _read_state!(similar(h.u0), ctx, h.u),
-        )
+            (LibPETSc.TSGetSolveTime(pl, h.ts), _read_state!(similar(h.u0), ctx, h.u))
         st = _read_stats(h)
     finally
         _destroy!(h)
@@ -4896,9 +4894,7 @@ SciMLBase.initialize_dae!(integ::PETScIntegrator, init = _initializealg(integ)) 
 function _set_t_unlocked(integ::PETScIntegrator, t)
     integ.t = oftype(integ.t, t)
     _end_step_here!(integ)
-    integ.finished || LibPETSc.TSSetTime(
-        integ.h.petsclib, integ.h.ts, _petsc_t(integ.h.ctx, integ.tdir * integ.t),
-    )
+    integ.finished || LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * integ.t)
     return nothing
 end
 
@@ -4926,7 +4922,7 @@ function _change_t_unlocked(
     integ.dt = integ.t - integ.tprev
     _end_step_here!(integ)
     _write_state!(integ.h, integ.u)
-    LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, _petsc_t(integ.h.ctx, integ.tdir * t))
+    LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * t)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     T && _rewind_saves!(integ)
     _raise_threw!(integ)
@@ -5221,7 +5217,7 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     integ.t = t
     _dirty!(h.ctx)
     _write_state!(h, integ.u)
-    LibPETSc.TSSetTime(pl, h.ts, _petsc_t(h.ctx, integ.tdir * t))
+    LibPETSc.TSSetTime(pl, h.ts, integ.tdir * t)
     LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * dt)
     LibPETSc.TSRestartStep(pl, h.ts)
     integ.dt = integ.t - integ.tprev
@@ -5382,7 +5378,7 @@ function _reject_step!(integ::PETScIntegrator, before, taken)
         copyto!(integ.u, integ.uprev)
     end
     _write_state!(h, integ.u)
-    LibPETSc.TSSetTime(pl, h.ts, _petsc_t(ctx, integ.tdir * integ.t))
+    LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
     floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
     forced = get(integ.kwargs, :force_dtmin, false) === true
@@ -5427,7 +5423,7 @@ function _past_discontinuity!(integ::PETScIntegrator)
     h = integ.h
     s = nextfloat(integ.tdir * integ.t)
     integ.t = _user_t(integ.tdir, s)
-    LibPETSc.TSSetTime(h.petsclib, h.ts, _petsc_t(h.ctx, s))
+    LibPETSc.TSSetTime(h.petsclib, h.ts, s)
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     _dirty!(h.ctx)
     return nothing
@@ -5738,9 +5734,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     # PETSc keeps the step shortened onto its max time, so `dtcache` holds the uncut one.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
-    # TSSetMaxTime reads -1 as PETSC_DETERMINE; bump it only on an unshifted clock.
-    max_t = target == -1 && iszero(ctx.t_shift) ? nextfloat(target) : _petsc_t(ctx, target)
-    LibPETSc.TSSetMaxTime(pl, h.ts, max_t)
+    # TSSetMaxTime reads -1 as PETSC_DETERMINE; the step is cut to the target below.
+    LibPETSc.TSSetMaxTime(pl, h.ts, target == -1 ? nextfloat(target) : target)
     if h.matches
         _match_step!(integ, target - integ.tdir * integ.t)
     elseif LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
@@ -5764,7 +5759,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     end
     h.stopped == 0 ? _undo_failed_irk!(ctx, pl, h.ts.ptr) :
         _warn_failed_step(integ.alg, h.stopped, integ.opts.verbose)
-    integ.t = _user_t(integ.tdir, _logical_t(ctx, LibPETSc.TSGetTime(pl, h.ts)))
+    integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
     if integ.tdir * integ.t <= integ.tdir * start
         if h.stopped == 0 && Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
             _stalled!(h, integ.alg, integ.t, integ.opts.verbose)
@@ -5779,11 +5774,11 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         h.matches || (integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts))
         if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
             integ.t = _user_t(integ.tdir, h.tf)
-            LibPETSc.TSSetTime(pl, h.ts, _petsc_t(ctx, h.tf))
+            LibPETSc.TSSetTime(pl, h.ts, h.tf)
         end
     elseif integ.tdir * integ.t >= stop - _near(stop)
         integ.t = _user_t(integ.tdir, stop)
-        LibPETSc.TSSetTime(pl, h.ts, _petsc_t(ctx, stop))
+        LibPETSc.TSSetTime(pl, h.ts, stop)
         LibPETSc.TSSetTimeStep(pl, h.ts, _resumed_step(integ, stop))
     end
     integ.dt = integ.t - integ.tprev
