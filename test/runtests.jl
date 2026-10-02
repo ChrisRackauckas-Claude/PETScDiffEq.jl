@@ -151,6 +151,24 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.15), orders)
     end
 
+    @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
+        # PETSc evaluates an explicit first stage at stale stage_time==0 on steprestart;
+        # the package runs that clock from 0 so the stale value is the correct start.
+        f!(du, u, p, t) = (du[1] = cos(t); nothing)
+        t0 = 1.0
+        prob = SciMLBase.ODEProblem(f!, [sin(t0)], (t0, t0 + 1))
+        sol = SciMLBase.solve(
+            prob, PETScDiffEq.TSARKIMEX("3"); dt = 0.01, adaptive = false,
+        )
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test abs(sol.u[end][1] - sin(t0 + 1)) < 1.0e-6
+        half = SciMLBase.solve(
+            prob, PETScDiffEq.TSARKIMEX("3"); dt = 0.005, adaptive = false,
+        )
+        @test abs(half.u[end][1] - sin(t0 + 1)) <
+            0.3 * abs(sol.u[end][1] - sin(t0 + 1))
+    end
+
     @testset "TSARKIMEX IMEX split" begin
         stiff!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
         forcing!(du, u, p, t) = (du[1] = 1.0; nothing)
