@@ -3648,10 +3648,25 @@ function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where
     return v
 end
 
-_state_vec(petsclib, ::Nothing, n) = PETScCompat.PetscVec(petsclib, n)
-_state_vec(petsclib, comm::MPI.Comm, n) = LibPETSc.VecCreateMPI(
-    petsclib, comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
-)
+# PETSc's GEMV VecMDot groups vectors by address, so Krylov sums would follow the heap layout.
+function _plain_mdot(f, petsclib)
+    opts = PETScCompat.PetscOptions(petsclib; vec_mdot_use_gemv = "0")
+    push!(opts)
+    try
+        return f()
+    finally
+        pop!(opts)
+        PETScCompat.destroy!(opts)
+    end
+end
+
+_state_vec(petsclib, ::Nothing, n) =
+    _plain_mdot(() -> PETScCompat.PetscVec(petsclib, n), petsclib)
+_state_vec(petsclib, comm::MPI.Comm, n) = _plain_mdot(petsclib) do
+    LibPETSc.VecCreateMPI(
+        petsclib, comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
+    )
+end
 _work_vec(petsclib, ::Nothing, u, n) = PETScCompat.PetscVec(petsclib, n)
 _work_vec(petsclib, ::MPI.Comm, u, n) = LibPETSc.VecDuplicate(petsclib, u)
 
@@ -3740,9 +3755,11 @@ _in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roo
 function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
     pl, ctx = h.petsclib, h.ctx
     comm, n = ctx.comm, length(h.u0)
-    x = LibPETSc.VecCreateMPI(
-        pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
-    )
+    x = _plain_mdot(pl) do
+        LibPETSc.VecCreateMPI(
+            pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
+        )
+    end
     lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
     if _everywhere(comm, hi - lo == n)
         PETScCompat.destroy!(x)
@@ -4041,15 +4058,17 @@ function _set_second_order_solution!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv) w
     ptr = pointer(a)
     LibPETSc.VecRestoreArrayRead(pl, h.u, a)
     comm = h.ctx.comm
-    part(p, len) = comm === nothing ?
-        LibPETSc.VecCreateSeqWithArray(
-            pl, MPI.COMM_SELF, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
-            unsafe_wrap(Array, p, len),
-        ) :
-        LibPETSc.VecCreateMPIWithArray(
-            pl, comm, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
-            LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), unsafe_wrap(Array, p, len),
-        )
+    part(p, len) = _plain_mdot(pl) do
+        comm === nothing ?
+            LibPETSc.VecCreateSeqWithArray(
+                pl, MPI.COMM_SELF, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
+                unsafe_wrap(Array, p, len),
+            ) :
+            LibPETSc.VecCreateMPIWithArray(
+                pl, comm, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
+                LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), unsafe_wrap(Array, p, len),
+            )
+    end
     v = part(ptr, nv)
     push!(h.tolvecs, v)
     u = part(ptr + nv * sizeof(S), n - nv)
@@ -4407,7 +4426,7 @@ function _setup(
     end
     clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
     uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
-        LibPETSc.DMCreateGlobalVector(petsclib, clone)
+        _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib)
     A = dyn && kept === nothing ? typeof(similar(prob.u0, U)) : Vector{U}
     # f scatters through the caller's DM, so the handle holds a reference to it.
     dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
@@ -4419,7 +4438,7 @@ function _setup(
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
         clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
-            LibPETSc.DMCreateGlobalVector(petsclib, clone),
+            _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
@@ -4565,7 +4584,8 @@ function _setup(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
             _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
-            effective_options = ["-ts_error_if_step_fails", "false"]
+            # With a dm the Krylov vectors come from the DM inside the solve, under these options.
+            effective_options = ["-ts_error_if_step_fails", "false", "-vec_mdot_use_gemv", "0"]
             # TSSetMaxTime reads -1 as PETSC_DETERMINE; the option is stored as given.
             tf == -1 && push!(effective_options, "-ts_max_time=-1")
             append!(effective_options, _default_options(alg))
