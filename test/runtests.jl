@@ -9128,12 +9128,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         () -> grad(parts, TSARKIMEX(); g = coupled),
                     ),
                     (
-                        "PETScAdjoint does not support TSARKIMEX(\"3\") on an ODEProblem whose " *
+                        "PETScDiffEq does not support TSARKIMEX(\"3\") on an ODEProblem whose " *
                             "tspan starts away from 0",
                         () -> grad(adj_prob(copy(u0), copy(p0), (1.0, 0.0)), TSARKIMEX(); t = backward_t),
                     ),
                     (
-                        "PETScAdjoint does not support TSARKIMEX(\"4\") on an ODEProblem whose " *
+                        "PETScDiffEq does not support TSARKIMEX(\"4\") on an ODEProblem whose " *
                             "tspan starts away from 0",
                         () -> grad(
                             adj_prob(copy(u0), copy(p0), (1.0, 2.0)),
