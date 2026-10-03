@@ -5820,7 +5820,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             for alg in cubic, (prob, want, _) in spans
                 # Explicit-first-stage ARKIMEX is refused when tspan starts away from 0.
-                alg isa PETScDiffEq.TSARKIMEX && !iszero(first(prob.tspan)) && continue
+                if alg isa PETScDiffEq.TSARKIMEX && !iszero(first(prob.tspan))
+                    @test_throws ArgumentError matches_petsc(prob, alg)
+                    continue
+                end
                 @test matches_petsc(prob, alg)
                 kw = (; fixed..., saveat = want, inner...)
                 @test SciMLBase.solve(prob, alg; kw...).u ==
@@ -5859,10 +5862,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             for alg in algs, (prob, want, level) in spans
                 # Explicit-first-stage ARKIMEX (and default Generic arkimex) refused away from 0.
-                if !iszero(first(prob.tspan))
-                    alg isa PETScDiffEq.TSGeneric && alg.ts_type == "arkimex" && continue
-                    alg isa PETScDiffEq.TSARKIMEX &&
-                        !(alg.subtype in PETScDiffEq._ARKIMEX_IMPLICIT_FIRST_STAGE) && continue
+                if !iszero(first(prob.tspan)) && (
+                        (alg isa PETScDiffEq.TSGeneric && alg.ts_type == "arkimex") ||
+                            (
+                            alg isa PETScDiffEq.TSARKIMEX &&
+                                !(alg.subtype in PETScDiffEq._ARKIMEX_IMPLICIT_FIRST_STAGE)
+                        )
+                    )
+                    @test_throws ArgumentError SciMLBase.solve(prob, alg; fixed...)
+                    continue
                 end
                 dense = SciMLBase.solve(prob, alg; fixed...)
                 expected = [dense(t) for t in want]
