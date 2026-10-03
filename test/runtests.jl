@@ -3199,7 +3199,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             nan = (du, u, p, t) -> (du[1] = NaN; nothing)
             for (_, alg) in adaptive[1:3]
-                fails = map(((0.0, 1.0), (1.0, 2.0))) do span
+                # Explicit-first-stage ARKIMEX is refused when tspan starts away from 0.
+                spans = alg isa PETScDiffEq.TSARKIMEX ?
+                    ((0.0, 1.0), (0.0, 2.0)) : ((0.0, 1.0), (1.0, 2.0))
+                fails = map(spans) do span
                     sol = @test_logs failed SciMLBase.solve(
                         SciMLBase.ODEProblem(nan, [1.0], span), alg,
                     )
@@ -5855,9 +5858,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 st in skip || push!(algs, family(st))
             end
             for alg in algs, (prob, want, level) in spans
-                # Default arkimex has an explicit first stage; refuse when tspan starts away from 0.
-                alg isa PETScDiffEq.TSGeneric && alg.ts_type == "arkimex" &&
-                    !iszero(first(prob.tspan)) && continue
+                # Explicit-first-stage ARKIMEX (and default Generic arkimex) refused away from 0.
+                if !iszero(first(prob.tspan))
+                    alg isa PETScDiffEq.TSGeneric && alg.ts_type == "arkimex" && continue
+                    alg isa PETScDiffEq.TSARKIMEX &&
+                        !(alg.subtype in PETScDiffEq._ARKIMEX_IMPLICIT_FIRST_STAGE) && continue
+                end
                 dense = SciMLBase.solve(prob, alg; fixed...)
                 expected = [dense(t) for t in want]
                 kw = (; fixed..., saveat = want, inner...)
