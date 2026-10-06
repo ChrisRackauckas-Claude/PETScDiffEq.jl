@@ -324,11 +324,6 @@ implicit.
 `"bpr3"` is refused on a `SplitODEProblem`, where it converges at first order. On a
 plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3.
 
-On a plain `ODEProblem`, every type but `"1bee"`, `"l2"` and `"prssp2"` has an explicit
-first stage that PETSc evaluates at a stale time on the first step when `tspan` starts
-away from 0, so those configurations are refused. A `SplitODEProblem` has no such limit.
-The refusal follows the type PETSc runs after `petsc_options`, not only the constructor.
-
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the whole pattern of
 a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
@@ -635,9 +630,6 @@ _uses_ifunction(alg::TSGeneric) = !alg.explicit
 const _RK_NO_ESTIMATE = ("1fe", "2b", "3", "4")
 const _ROSW_NO_ESTIMATE = ("theta1", "theta2")
 const _ARKIMEX_NO_ESTIMATE = ("prssp2", "ars443", "bpr3")
-# Types whose first stage is implicit; the rest evaluate an explicit first stage at a
-# stale time on the first step after a restart when the span does not start at 0.
-const _ARKIMEX_IMPLICIT_FIRST_STAGE = ("1bee", "l2", "prssp2")
 
 function _adapts(name::AbstractString)
     type, sub = first(split(name)), last(split(name))
@@ -2945,8 +2937,29 @@ function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
+# PETSc solves for arkimex's first-stage slope, never into a stage vector, at a stale time.
+function _stage_time(ctx, ts, t)
+    startswith(ctx.alg_name, "arkimex") || ctx.alg_name == "dirk" || return t
+    pl = ctx.petsclib
+    x = Ref{LibPETSc.CVec}(C_NULL)
+    ccall(
+        _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), _snes(pl, ts), x,
+    )
+    x[] == C_NULL && return t
+    ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
+    ccall(
+        _symbol(pl, :TSGetStages), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts, ns, stages,
+    )
+    for i in 1:ns[]
+        unsafe_load(stages[], i) == x[] && return t
+    end
+    return LibPETSc.TSGetTime(pl, LibPETSc.TS(ts, pl))
+end
+
 function _ifunction!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -2954,12 +2967,13 @@ function _ifunction!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
+    return _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
 end
 
-function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
+function _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
         udot = _readvec!(ctx.mudot, pl, _own_block(ctx, PETSc.VecPtr(pl, xdot_ptr, false)))
         if ctx.dae
@@ -3218,7 +3232,7 @@ function _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
 end
 
 function _ijacobian!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -3228,14 +3242,15 @@ function _ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+    return _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
-function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, ctx.petsclib, x)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
@@ -3256,7 +3271,7 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
 function _dm_ijacobian!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -3266,15 +3281,16 @@ function _dm_ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+    return _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
 # The user fills J = df/du in the DM's matrix, which becomes `shift * M - J` here.
-function _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     pl = ctx.petsclib
     A = LibPETSc.PetscMat(A_ptr, pl)
     B = LibPETSc.PetscMat(B_ptr, pl)
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         _mat_zero!(pl, B)
         err = nothing
@@ -3311,7 +3327,7 @@ function _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
 function _sparse_ijacobian!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -3321,14 +3337,15 @@ function _sparse_ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+    return _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
-function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, ctx.petsclib, _own_block(ctx, x))
         if ctx.coo === nothing
             _call_jac!(ctx, xdot_ptr, shift, t)
@@ -3733,23 +3750,6 @@ function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
         )
     end
     return nothing
-end
-
-function _refuse_arkimex_stale_stage(name, is_split, t0)
-    startswith(name, "arkimex ") || return nothing
-    is_split && return nothing
-    iszero(t0) && return nothing
-    sub = last(split(name))
-    sub in _ARKIMEX_IMPLICIT_FIRST_STAGE && return nothing
-    throw(
-        ArgumentError(
-            "PETScDiffEq does not support TSARKIMEX(\"$sub\") on an ODEProblem whose " *
-                "tspan starts away from 0: PETSc's arkimex evaluates this type's explicit " *
-                "first stage at a stale time (0) on the first step after a restart; " *
-                "start tspan at 0, use a SplitODEProblem, or use \"1bee\", \"l2\" or " *
-                "\"prssp2\", whose first stage is implicit",
-        ),
-    )
 end
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
@@ -4982,9 +4982,6 @@ function _setup(
             )
             running = _running_name(petsclib, ts)
             _refuse_method(running, has_mass, has_jac, is_split, is_dae)
-            _checked_everywhere(comm) do
-                _refuse_arkimex_stale_stage(running, is_split, t0)
-            end
             comm === nothing || chosen != "irk" ||
                 _irk_on_petsc_split!(h, N, rows, cols, ptrs.sparse_ijacobian, ctxptr)
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
