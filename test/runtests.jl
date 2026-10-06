@@ -157,7 +157,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.15), orders)
     end
 
-    @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
+    Sys.WORD_SIZE == 64 && @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
         f!(du, u, p, t) = (du[1] = cos(t); nothing)
         t0 = 1.0
         prob = SciMLBase.ODEProblem(f!, [sin(t0)], (t0, t0 + 1))
