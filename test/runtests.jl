@@ -9686,6 +9686,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (0.0, 1.0), forward_t, (sparse_jac = true, coupled = true),
                 ),
                 ("2e out of place", "2e", (0.0, 1.0), forward_t, (oop = true,)),
+                ("3 from t = 1", "3", (1.0, 2.0), forward_t .+ 1, (;)),
+                ("4 backward in time", "4", (1.0, 0.0), backward_t, (;)),
+                (
+                    "3 backward in time with a trajectory of states only", "3", (1.0, 0.0),
+                    backward_t, (sensealg = states_only,),
+                ),
                 ("l2 backward in time", "l2", (1.0, 0.0), backward_t, (;)),
                 (
                     "1bee backward in time with a trajectory of states only", "1bee",
@@ -9806,6 +9812,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 name, subtype, make, tspan,
             ) in (
                 ("3", "3", adj_prob, (0.0, 1.0)),
+                ("4 backward in time", "4", adj_prob, (1.0, 0.0)),
                 ("a split problem, 3", "3", split_prob, (0.0, 1.0)),
                 ("a split problem, 4 backward in time", "4", split_prob, (1.0, 0.0)),
             )
@@ -10329,27 +10336,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (
                         "PETScAdjoint cannot take an integral cost with TSARKIMEX",
                         () -> grad(parts, TSARKIMEX(); g = coupled),
-                    ),
-                    (
-                        "PETScAdjoint does not support TSARKIMEX(\"3\") on an ODEProblem whose " *
-                            "tspan starts away from 0",
-                        () -> grad(adj_prob(copy(u0), copy(p0), (1.0, 0.0)), TSARKIMEX(); t = backward_t),
-                    ),
-                    (
-                        "PETScAdjoint does not support TSARKIMEX(\"4\") on an ODEProblem whose " *
-                            "tspan starts away from 0",
-                        () -> grad(
-                            adj_prob(copy(u0), copy(p0), (1.0, 2.0)),
-                            TSImplicit("beuler", ["-ts_type", "arkimex", "-ts_arkimex_type", "4"]);
-                            t = [2.0],
-                        ),
-                    ),
-                    (
-                        "PETScAdjoint does not support `-ts_trajectory_solution_only` with " *
-                            "TSARKIMEX(\"3\") on an ODEProblem",
-                        () -> grad(
-                            prob, TSARKIMEX(); sensealg = PETScAdjoint(petsc_options = states_only),
-                        ),
                     ),
                     (
                         "PETScAdjoint does not support `-ts_arkimex_fully_implicit` on a " *
