@@ -17,6 +17,7 @@ const N = 23
 const SPAN = (0.0, 0.1)
 const TOL = (abstol = 1.0e-8, reltol = 1.0e-8)
 const SERIAL_GAP = 5.0e-10
+const INIT_GAP = 1.0e-14
 const thrower = nranks - 1
 
 function uneven(n)
@@ -73,7 +74,7 @@ end
 function halo(u)
     left = rank == 0 ? MPI.PROC_NULL : rank - 1
     right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
-    gl, gr = zeros(1), zeros(1)
+    gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
     MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
     MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
     return gl[1], gr[1]
@@ -205,6 +206,95 @@ const METHODS = (
         end
     end
 
+    @testset "TSIRK on any split of the state" begin
+        hollow = copy(counts)
+        nranks > 1 && (hollow[2] += hollow[1]; hollow[1] = 0)
+        function spread(blocks)
+            full = findall(>(0), blocks) .- 1
+            k = findfirst(==(rank), full)
+            k === nothing && return (du, u, p, t) -> nothing
+            left = k == 1 ? MPI.PROC_NULL : full[k - 1]
+            right = k == length(full) ? MPI.PROC_NULL : full[k + 1]
+            return function (du, u, p, t)
+                gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
+                MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
+                MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
+                return laplacian!(du, u, gl[1], gr[1])
+            end
+        end
+        split_heat(blocks; jac) = ODEProblem(
+            heat_function(spread(blocks), owned(blocks); jac), heat0(owned(blocks)), SPAN,
+        )
+        serial_heat(; jac) = ODEProblem(heat_function(heat_serial!, 1:N; jac), heat0(1:N), SPAN)
+        stepped(prob, alg) = solve(prob, alg; dt = 1.0e-3)
+        saved(prob, alg) = solve(prob, alg; dt = 1.0e-3, saveat = 0.0125)
+        halve = SciMLBase.DiscreteCallback((u, t, i) -> t == 0.05, i -> (i.u .*= 0.5))
+        halved(prob, alg) = solve(prob, alg; dt = 1.0e-3, callback = halve, tstops = [0.05])
+        function restarted(prob, alg)
+            integ = SciMLBase.init(prob, alg; dt = 1.0e-3)
+            foreach(_ -> SciMLBase.step!(integ), 1:10)
+            SciMLBase.set_u!(integ, 0.5 .* integ.u)
+            return SciMLBase.solve!(integ)
+        end
+        ad = AutoForwardDiff()
+        cases = (
+            (stepped, TSIRK(1; comm), TSIRK(1), true),
+            (stepped, TSIRK(2; comm), TSIRK(2), true),
+            (stepped, TSIRK(3; comm), TSIRK(3), true),
+            (stepped, TSIRK(2; comm, autodiff = ad), TSIRK(2; autodiff = ad), false),
+            (stepped, TSGeneric("irk"; comm), TSGeneric("irk"), true),
+            (saved, TSIRK(3; comm), TSIRK(3), true),
+            (halved, TSIRK(3; comm), TSIRK(3), true),
+            (restarted, TSIRK(3; comm), TSIRK(3), true),
+        )
+        splits = nranks > 1 ? (counts, hollow) : (counts,)
+        for blocks in splits, (solve_with, alg, serial, jac) in cases
+            sol = solve_with(split_heat(blocks; jac), alg)
+            @test sol.retcode == ReturnCode.Success
+            @test all(u -> length(u) == blocks[rank + 1], sol.u)
+            us = gathered(sol, blocks)
+            if rank == 0
+                ref = solve_with(serial_heat(; jac), serial)
+                @test sol.t == ref.t
+                @test maxdiff(us, ref.u) <= SERIAL_GAP
+                if solve_with === stepped && alg isa TSIRK
+                    err = (4.0e-6, 1.0e-10, 5.0e-12)[alg.nstages]
+                    @test maximum(abs, us[end] - heat_exact(SPAN[2])) <= err
+                end
+            end
+        end
+        bad_f = heat_function(throwing(heat!, "f"), rows; jac = true)
+        bad_jac = ODEFunction(
+            heat!; jac = throwing(heat_jac(rows), "jac"), jac_prototype = heat_proto(rows),
+        )
+        for (what, fn) in (("f", bad_f), ("jac", bad_jac))
+            prob = ODEProblem(fn, heat0(rows), SPAN)
+            @test raised(caught(() -> solve(prob, TSIRK(2; comm); dt = 1.0e-3)), what)
+        end
+        nan_after(f, i) = function (du, u, p, t)
+            f(du, u, p, t)
+            t > 0.05 && i > 0 && (du[i] = NaN)
+            return nothing
+        end
+        nan_fn = heat_function(nan_after(heat!, rank == thrower ? 1 : 0), rows; jac = true)
+        failed = solve(ODEProblem(nan_fn, heat0(rows), SPAN), TSIRK(2; comm); dt = 1.0e-3)
+        @test failed.retcode == ReturnCode.ConvergenceFailure
+        failed_us = gathered(failed, counts)
+        if rank == 0
+            first_row = sum(counts[1:thrower]) + 1
+            serial_fn = heat_function(nan_after(heat_serial!, first_row), 1:N; jac = true)
+            failed_ref = solve(ODEProblem(serial_fn, heat0(1:N), SPAN), TSIRK(2); dt = 1.0e-3)
+            @test failed_ref.retcode == ReturnCode.ConvergenceFailure
+            @test failed.t == failed_ref.t
+            @test maxdiff(failed_us, failed_ref.u) <= SERIAL_GAP
+        end
+        mass = Diagonal(fill(2.0, length(rows)))
+        massive = ODEProblem(
+            heat_function(heat!, rows; jac = true, mass_matrix = mass), heat0(rows), SPAN,
+        )
+        @test refused(() -> solve(massive, TSIRK(2; comm); dt = 1.0e-3), "a mass matrix with TSIRK")
+    end
+
     @testset "a DAEProblem" begin
         residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
         dae_jac(idx) = function (J, du, u, p, gamma, t)
@@ -301,7 +391,7 @@ const METHODS = (
             return nothing
         end
         entries = ((1, 2, 1.0), (1, 3, -1.0), (2, 1, 1.0), (2, 3, -2.0), (3, 1, -1.0), (3, 2, 1.0))
-        function cell_problem(cells; jac, sparse_mass = false)
+        function cell_problem(cells; jac, sparse_mass = false, kw...)
             n, offset = 3length(cells), 3(first(cells) - 1)
             I = [3(c - 1) + i for c in 1:length(cells) for (i, _, _) in entries]
             J = [offset + 3(c - 1) + j for c in 1:length(cells) for (_, j, _) in entries]
@@ -311,8 +401,8 @@ const METHODS = (
             m = repeat([0.0, 0.0, 1.0], length(cells))
             M = sparse_mass ? sparse(1:n, offset .+ (1:n), m, n, 3sum(cell_counts)) : Diagonal(m)
             fn = jac ?
-                ODEFunction(cell!; jac = cell_jac!, jac_prototype = proto, mass_matrix = M) :
-                ODEFunction(cell!; jac_prototype = proto, mass_matrix = M)
+                ODEFunction(cell!; jac = cell_jac!, jac_prototype = proto, mass_matrix = M, kw...) :
+                ODEFunction(cell!; jac_prototype = proto, mass_matrix = M, kw...)
             return ODEProblem(fn, repeat([2.0, 1.0, 1.0], length(cells)), (0.0, 1.0))
         end
         exact = repeat(exp(-1) .* [2.0, 1.0, 1.0], sum(cell_counts))
@@ -330,12 +420,37 @@ const METHODS = (
             @test caught(() -> solve(off, TSImplicit("bdf"; comm); TOL...)) isa
                 SciMLBase.CheckInitFailureError
         end
-        off = SciMLBase.remake(cell_problem(cells; jac = true); u0)
-        brown = DiffEqBase.BrownFullBasicInit()
-        @test refused(
-            () -> solve(off, TSImplicit("bdf"; comm); initializealg = brown, TOL...),
-            "BrownFullBasicInit",
+        whole = repeat([2.0, 1.0, 1.0], sum(cell_counts))
+        whole[3sum(cell_counts[1:thrower]) + 1] += 1
+        for sparse_mass in (false, true), (jac, ad) in SOURCES,
+                init in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            off = SciMLBase.remake(cell_problem(cells; jac, sparse_mass); u0)
+            sol = solve(off, TSImplicit("bdf"; comm); initializealg = init, TOL...)
+            @test sol.retcode == ReturnCode.Success
+            start = gathered(sol.u[1], 3 .* cell_counts)
+            if rank == 0
+                serial = SciMLBase.remake(
+                    cell_problem(1:sum(cell_counts); jac, sparse_mass); u0 = whole,
+                )
+                serial_alg = TSImplicit("bdf"; autodiff = ad)
+                ref = solve(serial, serial_alg; initializealg = init, TOL...)
+                @test start != whole
+                @test maximum(abs, start - ref.u[1]) <= INIT_GAP
+            end
+        end
+        data = SciMLBase.OverrideInitData(
+            SciMLBase.NonlinearProblem((u, p) -> u .- 1, [0.0]), nothing, nothing, nothing,
         )
+        own = cell_problem(cells; jac = true, initialization_data = data)
+        for init in (DiffEqBase.DefaultInit(), SciMLBase.OverrideInit())
+            @test refused(
+                () -> solve(own, TSImplicit("bdf"; comm); initializealg = init, TOL...),
+                "OverrideInit",
+            )
+        end
+        @test solve(
+            own, TSImplicit("bdf"; comm); initializealg = SciMLBase.CheckInit(), TOL...,
+        ).retcode == ReturnCode.Success
     end
 
     @testset "a rank whose own mass block is the identity" begin
@@ -380,6 +495,130 @@ const METHODS = (
                 layout = fill(2, nranks), TOL...,
             )
         end
+    end
+
+    @testset "BrownFullBasicInit and ShampineCollocationInit solve on every rank" begin
+        brown = DiffEqBase.BrownFullBasicInit()
+        shampine = DiffEqBase.ShampineCollocationInit()
+        algebraic(i) = i % 4 == 0
+        function chain(idx, serial, form; jac, hopeless = false, throws = false, mass = nothing)
+            function f!(du, u, p, t)
+                left, right = serial ? (0.0, 0.0) : halo(u)
+                for (k, i) in enumerate(idx)
+                    l = k == 1 ? left : u[k - 1]
+                    r = k == length(u) ? right : u[k + 1]
+                    du[k] = !algebraic(i) ? l - 2u[k] + r :
+                        hopeless && i == 20 ? u[k]^2 + 1 : u[k]^3 + u[k] - (l + r) / 2 - 0.1
+                end
+                throws && rank == thrower && u != heat0(idx) && error("f threw on rank $rank")
+                return nothing
+            end
+            function jac!(J, u, p, t)
+                for (k, i) in enumerate(idx), j in neighbours(i)
+                    J[k, j] = algebraic(i) ? (i == j ? 3u[k]^2 + 1 : -0.5) : (i == j ? -2 : 1)
+                end
+                return nothing
+            end
+            n, m = length(idx), [algebraic(i) ? 0.0 : 1.0 for i in idx]
+            proto = heat_proto(idx)
+            if form == :dae
+                residual!(r, du, u, p, t) = (f!(r, u, p, t); r .= m .* du .- r; nothing)
+                function dae_jac!(J, du, u, p, gamma, t)
+                    jac!(J, u, p, t)
+                    for (k, i) in enumerate(idx), j in neighbours(i)
+                        J[k, j] = (i == j) * gamma * m[k] - J[k, j]
+                    end
+                    return nothing
+                end
+                fn = jac ? DAEFunction(residual!; jac = dae_jac!, jac_prototype = proto) :
+                    DAEFunction(residual!; jac_prototype = proto)
+                return DAEProblem(fn, zeros(n), heat0(idx), SPAN; differential_vars = m .!= 0)
+            end
+            M = form == :diag ? Diagonal(m) : sparse(1:n, idx, m, n, size(proto, 2))
+            M = something(mass, M)
+            fn = jac ? ODEFunction(f!; jac = jac!, jac_prototype = proto, mass_matrix = M) :
+                ODEFunction(f!; jac_prototype = proto, mass_matrix = M)
+            return ODEProblem(fn, heat0(idx), SPAN)
+        end
+        method(form; kw...) = form == :dae ? TSDAE("bdf"; kw...) : TSImplicit("bdf"; kw...)
+        rest = [(N - 3) ÷ (nranks - 1) + (r < (N - 3) % (nranks - 1)) for r in 0:(nranks - 2)]
+        lean = nranks == 1 ? [N] : [3; rest]
+        for layout in (counts, lean), form in (:diag, :sparse, :dae), (jac, ad) in SOURCES
+            prob = chain(owned(layout), false, form; jac)
+            @test caught(() -> solve(prob, method(form; comm); TOL...)) isa
+                SciMLBase.CheckInitFailureError
+            for init in (brown, shampine)
+                sol = solve(prob, method(form; comm); initializealg = init, TOL...)
+                @test sol.retcode == ReturnCode.Success
+                start, u = gathered(sol.u[1], layout), gathered(sol.u[end], layout)
+                if rank == 0
+                    serial = chain(1:N, true, form; jac)
+                    ref = solve(serial, method(form; autodiff = ad); initializealg = init, TOL...)
+                    @test maximum(abs, start - heat0(1:N)) > 0.1
+                    @test maximum(abs, start - ref.u[1]) <= INIT_GAP
+                    @test sol.t[end] == ref.t[end]
+                    @test maximum(abs, u - ref.u[end]) <= SERIAL_GAP
+                end
+            end
+        end
+        for form in (:diag, :dae), init in (brown, shampine)
+            sol = solve(
+                chain(rows, false, form; jac = false, hopeless = true), method(form; comm);
+                initializealg = init, TOL...,
+            )
+            @test sol.retcode == ReturnCode.InitialFailure
+            @test sol.t == [SPAN[1]]
+            for jac in (true, false)
+                prob = chain(rows, false, form; jac, throws = true)
+                e = caught(() -> solve(prob, method(form; comm); initializealg = init, TOL...))
+                @test raised(e, "f threw")
+            end
+        end
+        bump = SciMLBase.DiscreteCallback(
+            (u, t, integ) -> t == 0.05, integ -> (integ.u .+= 0.02; nothing),
+        )
+        function lifecycle(prob, alg, layout)
+            g(u) = layout === nothing ? copy(u) : gathered(u, layout)
+            integ = SciMLBase.init(prob, alg; initializealg = brown, TOL...)
+            SciMLBase.set_u!(integ, integ.u .+ 0.05)
+            SciMLBase.initialize_dae!(integ, shampine)
+            out = [g(integ.u)]
+            SciMLBase.set_u!(integ, integ.u .+ 0.05)
+            SciMLBase.initialize_dae!(integ)
+            push!(out, g(integ.u))
+            SciMLBase.reinit!(integ, prob.u0 .+ 0.01)
+            push!(out, g(integ.u))
+            SciMLBase.terminate!(integ)
+            kw = (; initializealg = brown, callback = bump, tstops = [0.05])
+            sol = solve(prob, alg; kw..., TOL...)
+            return out, g(sol.u[findlast(==(0.05), sol.t)])
+        end
+        for form in (:diag, :sparse, :dae), (jac, ad) in SOURCES
+            got, after = lifecycle(chain(rows, false, form; jac), method(form; comm), counts)
+            if rank == 0
+                ref, ref_after = lifecycle(
+                    chain(1:N, true, form; jac), method(form; autodiff = ad), nothing,
+                )
+                @test maxdiff(got, ref) <= 1.0e-11
+                @test maximum(abs, after - ref_after) <= SERIAL_GAP
+            end
+        end
+        n = length(rows)
+        moved = sparse(
+            1:n, [i > 1 && algebraic(i - 1) ? i - 1 : i for i in rows],
+            [algebraic(i) ? 0.0 : 1.0 for i in rows], n, N,
+        )
+        odd = chain(rows, false, :diag; jac = true, mass = moved)
+        @test refused(
+            () -> solve(odd, TSImplicit("bdf"; comm); initializealg = brown, TOL...),
+            "its zero columns have to be its zero rows",
+        )
+        dae = chain(rows, false, :dae; jac = true)
+        unmarked = DAEProblem(dae.f, dae.du0, dae.u0, SPAN)
+        @test refused(
+            () -> solve(unmarked, TSDAE("bdf"; comm); initializealg = brown, TOL...),
+            "differential_vars",
+        )
     end
 
     @testset "SplitODEProblem with an explicit f2" begin
@@ -480,6 +719,77 @@ const METHODS = (
         end
     end
 
+    @testset "AutoForwardDiff colours the whole pattern for every rank" begin
+        ad = AutoForwardDiff()
+        heat(idx, f; jac = false) = ODEProblem(heat_function(f, idx; jac), heat0(idx), SPAN)
+        calls = Ref(0)
+        counting(f) = (du, u, p, t) -> (calls[] += 1; f(du, u, p, t))
+        for (make, err) in METHODS
+            calls[] = 0
+            sol = compare(
+                heat(rows, counting(heat!)), make(comm; autodiff = ad), heat(1:N, heat_serial!),
+                make(MPI.COMM_SELF; autodiff = ad), heat_exact(SPAN[2]), err; TOL...,
+            )
+            @test sol.stats.njacs > 0
+            @test same_everywhere(calls[])
+            @test same_everywhere(sol.stats.nf)
+            given = solve(heat(rows, heat!; jac = true), make(comm); TOL...)
+            @test sol.t == given.t
+            @test sol.u == given.u
+        end
+        residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
+        function dae(idx, f)
+            du0 = similar(heat0(idx))
+            f(du0, heat0(idx), nothing, 0.0)
+            fn = DAEFunction(residual(f); jac_prototype = heat_proto(idx))
+            return DAEProblem(fn, du0, heat0(idx), SPAN)
+        end
+        compare(
+            dae(rows, heat!), TSDAE("bdf"; comm, autodiff = ad), dae(1:N, heat_serial!),
+            TSDAE("bdf"; autodiff = ad), heat_exact(SPAN[2]), 1.5e-6; TOL...,
+        )
+        fade!(du, u, p, t) = (du .= -u; nothing)
+        halves(idx, f) = SplitODEProblem(heat_function(f, idx; jac = false), fade!, heat0(idx), SPAN)
+        compare(
+            halves(rows, heat!), TSARKIMEX(; comm, autodiff = ad), halves(1:N, heat_serial!),
+            TSARKIMEX(; autodiff = ad), exp(-SPAN[2]) .* heat_exact(SPAN[2]), 4.0e-8; TOL...,
+        )
+        irk_counts = even(N)
+        idx = owned(irk_counts)
+        sol = solve(heat(idx, heat!), TSIRK(2; comm, autodiff = ad); dt = 1.0e-3)
+        @test sol.retcode == ReturnCode.Success
+        us = gathered(sol, irk_counts)
+        if rank == 0
+            ref = solve(heat(1:N, heat_serial!), TSIRK(2; autodiff = ad); dt = 1.0e-3)
+            @test sol.t == ref.t
+            @test maxdiff(us, ref.u) <= SERIAL_GAP
+        end
+        prob = heat(rows, throwing(heat!, "f"))
+        @test raised(caught(() -> solve(prob, TSImplicit("bdf"; comm, autodiff = ad))), "f threw")
+        if nranks > 1
+            layout = copy(counts)
+            layout[2] += layout[1]
+            layout[1] = 0
+            function skipping!(du, u, p, t)
+                isempty(u) && return nothing
+                left = rank == 1 ? MPI.PROC_NULL : rank - 1
+                right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
+                gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
+                MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
+                MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
+                return laplacian!(du, u, gl[1], gr[1])
+            end
+            calls[] = 0
+            sol = compare(
+                heat(owned(layout), counting(skipping!)), TSImplicit("bdf"; comm, autodiff = ad),
+                heat(1:N, heat_serial!), TSImplicit("bdf"; autodiff = ad), heat_exact(SPAN[2]),
+                1.5e-6; layout, TOL...,
+            )
+            @test isempty(sol.u[end]) == (rank == 0)
+            @test same_everywhere(calls[])
+        end
+    end
+
     @testset "refusals" begin
         n = length(rows)
         heat(fn) = ODEProblem(fn, heat0(rows), SPAN)
@@ -489,9 +799,14 @@ const METHODS = (
             () -> solve(heat(ODEFunction(heat!; jac = heat_jac(rows))), bdf), "sparse `jac_prototype`",
         )
         @test refused(() -> solve(heat(ODEFunction(heat!)), bdf), "sparse `jac_prototype`")
+        zygote = PETScDiffEq.ADTypes.AutoZygote()
         @test refused(
-            () -> solve(coloured, TSImplicit("bdf"; comm, autodiff = AutoForwardDiff())),
-            "cannot use `AutoForwardDiff()`",
+            () -> solve(coloured, TSImplicit("bdf"; comm, autodiff = zygote)),
+            "AutoZygote()` on a communicator",
+        )
+        @test refused(
+            () -> solve(heat(ODEFunction(heat!)), TSImplicit("bdf"; comm, autodiff = AutoForwardDiff())),
+            "sparse `jac_prototype`",
         )
         for alg in (TSIRK(2; comm), TSGeneric("irk"; comm))
             @test refused(() -> solve(coloured, alg; dt = 1.0e-3), "TSIRK needs a `jac`")
@@ -510,14 +825,56 @@ const METHODS = (
         fn = ODEFunction(heat!; jac = heat_jac(rows), jac_prototype = wrong)
         e = caught(() -> solve(heat(fn), bdf))
         @test rank == thrower ? e isa ArgumentError && occursin("must be $n x $N", e.msg) : remote(e)
-        if nranks > 1
-            skewed = even(N)
-            skewed[end - 1] -= 1
-            skewed[end] += 1
-            idx = owned(skewed)
-            prob = ODEProblem(heat_function(heat!, idx; jac = true), heat0(idx), SPAN)
-            @test refused(() -> solve(prob, TSIRK(2; comm); dt = 1.0e-3), "PETSc's own share")
+    end
+
+    @testset "a Krylov dot product does not depend on where the vectors sit in memory: $(nameof(typeof(alg)))" for alg in (
+            TSImplicit("bdf"; comm), TSIRK(2; comm),
+        )
+        pl = PETSc.getlib(; PetscScalar = Float64)
+        lib = PETScDiffEq.LibPETSc
+        integ = SciMLBase.init(
+            ODEProblem(heat_function(heat!, rows; jac = true), heat0(rows), SPAN), alg;
+            TOL..., (alg isa TSIRK ? (; dt = 1.0e-3, adaptive = false) : (;))...,
+        )
+        x = lib.VecDuplicate(pl, integ.h.u)
+        len, m = Int(lib.VecGetLocalSize(pl, x)), 4
+        wrap(buf, off) = lib.VecCreateMPIWithArray(
+            pl, comm, lib.PetscInt(1), lib.PetscInt(len), lib.PetscInt(lib.PETSC_DECIDE),
+            unsafe_wrap(Array, pointer(buf, off + 1), len),
+        )
+        function mdot(ys)
+            z = zeros(m)
+            PETScDiffEq._check_code(
+                ccall(
+                    PETScDiffEq._symbol(pl, :VecMDot), PETScDiffEq.LibPETSc.PetscErrorCode,
+                    (Ptr{Cvoid}, PETScDiffEq.LibPETSc.PetscInt, Ptr{Ptr{Cvoid}}, Ptr{Float64}),
+                    x.ptr, m, [y.ptr for y in ys], z,
+                ),
+            )
+            return z
         end
+        # These gaps fail PETSc's stride test, so only the packed copy could go through GEMV.
+        offsets = [3len + 200, 0, len + 70, 2len + 140]
+        agree = map(1:20) do trial
+            PETScDiffEq.PETScCompat.with_local_array!(x; read = false, write = true) do a
+                a .= cos.(7trial .+ 3 .* (1:len) .+ 11rank)
+            end
+            Y = [sin(17trial + 3i + 5k + 11rank) for i in 1:len, k in 1:m]
+            packed, scattered = vec(Y), zeros(4len + 300)
+            for k in 1:m
+                scattered[offsets[k] .+ (1:len)] .= Y[:, k]
+            end
+            GC.@preserve packed scattered begin
+                a = [wrap(packed, (k - 1) * len) for k in 1:m]
+                b = [wrap(scattered, offsets[k]) for k in 1:m]
+                same = mdot(a) == mdot(b)
+                foreach(PETScDiffEq.PETScCompat.destroy!, [a; b])
+                same
+            end
+        end
+        @test all(agree)
+        PETScDiffEq.PETScCompat.destroy!(x)
+        SciMLBase.terminate!(integ)
     end
 
     @testset "every handle is freed" begin
