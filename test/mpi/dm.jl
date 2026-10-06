@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
 using LinearAlgebra: Diagonal
-using PETScDiffEq: PETSc, LibPETSc, PETScCompat, AutoForwardDiff, AutoFiniteDiff,
+using PETScDiffEq: PETSc, LibPETSc, PETScCompat, AutoForwardDiff, AutoFiniteDiff, DiffEqBase,
     reshape_local_array
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DAEFunction, SplitODEProblem,
     DiscreteCallback, ContinuousCallback, ReturnCode, init, solve, solve!, step!, get_du,
@@ -24,6 +24,18 @@ const ROUNDOFF = 5.0e-14
 # of a serial rosw one, whose parallel linear solves no Newton cleans up, and 2.0e-14 of colouring.
 const JAC_SERIAL_TOL = (bdf = 5.0e-13, rosw = 2.0e-8)
 const COLOUR_TOL = 1.0e-13
+const INIT_GAP = 1.0e-14
+# Measured at 1 to 3 ranks with direct linear solves: DMStag solves are within 8.0e-15 of the
+# serial ones and 1.1e-14 of colouring, steps and DAE initialization within 1.1e-19, and the
+# adjoint within 1.8e-15 relative.
+const STAG_SERIAL_TOL = 1.0e-13
+const STAG_STEP_TOL = 1.0e-15
+const STAG_ADJOINT_GAP = 1.0e-14
+# Measured at 1 to 3 ranks: DMPlex solves with a jac are within 6.0e-15 of the serial ones,
+# colouring within 9.8e-14 of them, and steps match exactly.
+const PLEX_SERIAL_TOL = 1.0e-13
+const PLEX_COLOUR_TOL = 5.0e-13
+const PLEX_STEP_TOL = 1.0e-15
 
 function uneven(n)
     counts = floor.(Int, n .* (1:nranks) ./ sum(1:nranks))
@@ -220,6 +232,427 @@ function throwing(f, when)
         return nothing
     end
 end
+
+# A damped wave on a DMStag: fluxes on the vertices, held at zero on the ends, pressures in the
+# cells, with `p` scaling the damping of each. The serial form orders them vertex, cell,
+# vertex, ..., as the ranks of the DM do in turn.
+const LEFT, RIGHT, ELEM = LibPETSc.DMSTAG_LEFT, LibPETSc.DMSTAG_RIGHT, LibPETSc.DMSTAG_ELEMENT
+const DOWN, UP = LibPETSc.DMSTAG_DOWN, LibPETSc.DMSTAG_UP
+const NS = 17
+const hs = 1 / NS
+const stag = PETSc.DMStag(
+    pl, comm, (GHOSTED,), (NS,), (1, 1), 1; points_per_proc = (LibPETSc.PetscInt.(uneven(NS)),),
+)
+stag_points(dm) = axes(reshape_local_array(zeros(PETScDiffEq._dm_local_size(pl, dm)), dm))
+
+function wave_dm!(du, u, p, t)
+    U, D = reshape_local_array(u, stag), reshape_local_array(du, stag)
+    for i in axes(D, 1)
+        D[LEFT, 1, i] = i == 1 || i == NS + 1 ? 0.0 :
+            -(U[ELEM, 1, i] - U[ELEM, 1, i - 1]) / hs - p[1] * U[LEFT, 1, i]
+        i <= NS &&
+            (D[ELEM, 1, i] = -(U[RIGHT, 1, i] - U[LEFT, 1, i]) / hs - p[2] * U[ELEM, 1, i]^3)
+    end
+    return nothing
+end
+
+function wave!(dx, x, p, t)
+    for v in 1:(NS + 1)
+        dx[2v - 1] = v == 1 || v == NS + 1 ? 0.0 : -(x[2v] - x[2v - 2]) / hs - p[1] * x[2v - 1]
+    end
+    for i in 1:NS
+        dx[2i] = -(x[2i + 1] - x[2i - 1]) / hs - p[2] * x[2i]^3
+    end
+    return nothing
+end
+
+function wave_jac_dm!(J, u, p, t)
+    U = reshape_local_array(u, stag)
+    for i in stag_points(stag)[1]
+        1 < i <= NS && set_stencil_values!(
+            J, (LEFT, 1, i), ((ELEM, 1, i - 1), (ELEM, 1, i), (LEFT, 1, i)),
+            (1 / hs, -1 / hs, -p[1]),
+        )
+        i <= NS && set_stencil_values!(
+            J, (ELEM, 1, i), ((LEFT, 1, i), (RIGHT, 1, i), (ELEM, 1, i)),
+            (1 / hs, -1 / hs, -3p[2] * U[ELEM, 1, i]^2),
+        )
+    end
+    return nothing
+end
+
+function wave_jac!(J, x, p, t)
+    # The adjoint hands `jac` the prototype's values, so every stored entry is written.
+    fill!(nonzeros(J), 0.0)
+    for v in 2:NS
+        J[2v - 1, 2v - 2], J[2v - 1, 2v], J[2v - 1, 2v - 1] = 1 / hs, -1 / hs, -p[1]
+    end
+    for i in 1:NS
+        J[2i, 2i - 1], J[2i, 2i + 1], J[2i, 2i] = 1 / hs, -1 / hs, -3p[2] * x[2i]^2
+    end
+    return nothing
+end
+
+function wave_paramjac_dm!(pJ, u, p, t)
+    U = reshape_local_array(u, stag)
+    A, B = reshape_local_array(view(pJ, :, 1), stag), reshape_local_array(view(pJ, :, 2), stag)
+    for i in axes(A, 1)
+        A[LEFT, 1, i] = i == 1 || i == NS + 1 ? 0.0 : -U[LEFT, 1, i]
+        B[LEFT, 1, i] = 0.0
+        i <= NS || continue
+        A[ELEM, 1, i] = 0.0
+        B[ELEM, 1, i] = -U[ELEM, 1, i]^3
+    end
+    return nothing
+end
+
+function wave_paramjac!(pJ, x, p, t)
+    fill!(pJ, 0.0)
+    for v in 2:NS
+        pJ[2v - 1, 1] = -x[2v - 1]
+    end
+    for i in 1:NS
+        pJ[2i, 2] = -x[2i]^3
+    end
+    return nothing
+end
+
+const NW = 2NS + 1
+band(r) = max(1, r - 2):min(NW, r + 2)
+const wave_proto = sparse(
+    [r for r in 1:NW for _ in band(r)], [c for r in 1:NW for c in band(r)],
+    ones(sum(length ∘ band, 1:NW)), NW, NW,
+)
+pressure(i) = sinpi((i - 0.5) * hs) + 0.3 * sinpi(3 * (i - 0.5) * hs)
+const wave0 = [isodd(k) ? 0.0 : pressure(k ÷ 2) for k in 1:NW]
+
+function on_wave(x, dm)
+    u = zeros(PETScDiffEq._dm_local_size(pl, dm))
+    a = reshape_local_array(u, dm)
+    for i in axes(a, 1)
+        a[LEFT, 1, i] = x[2i - 1]
+        i <= NS && (a[ELEM, 1, i] = x[2i])
+    end
+    return u
+end
+
+function wave_natural(u, dm)
+    x = zeros(NW)
+    a = reshape_local_array(u, dm)
+    for i in axes(a, 1)
+        x[2i - 1] = a[LEFT, 1, i]
+        i <= NS && (x[2i] = a[ELEM, 1, i])
+    end
+    return MPI.Reduce(x, +, comm; root = 0)
+end
+
+# A 2-D form of it: x-fluxes on the left faces, y-fluxes on the bottom ones, pressures in the
+# cells, numbered cells first in the serial form.
+const QX, QY = 6, 5
+const qx, qy = 1 / QX, 1 / QY
+cell(i, j) = (j - 1) * QX + i
+xface(i, j) = QX * QY + (j - 1) * (QX + 1) + i
+yface(i, j) = QX * QY + (QX + 1) * QY + (j - 1) * QX + i
+const NQ = QX * QY + (QX + 1) * QY + QX * (QY + 1)
+
+function flow_dm!(du, u, dm, t)
+    U, D = reshape_local_array(u, dm), reshape_local_array(du, dm)
+    for j in axes(D, 2), i in axes(D, 1)
+        j <= QY && (
+            D[LEFT, 1, i, j] = i == 1 || i == QX + 1 ? 0.0 :
+                -(U[ELEM, 1, i, j] - U[ELEM, 1, i - 1, j]) / qx - U[LEFT, 1, i, j]
+        )
+        i <= QX && (
+            D[DOWN, 1, i, j] = j == 1 || j == QY + 1 ? 0.0 :
+                -(U[ELEM, 1, i, j] - U[ELEM, 1, i, j - 1]) / qy - U[DOWN, 1, i, j]
+        )
+        i <= QX && j <= QY && (
+            D[ELEM, 1, i, j] = -(
+                (U[RIGHT, 1, i, j] - U[LEFT, 1, i, j]) / qx +
+                    (U[UP, 1, i, j] - U[DOWN, 1, i, j]) / qy
+            ) - U[ELEM, 1, i, j]^3
+        )
+    end
+    return nothing
+end
+
+function flow!(dx, x, p, t)
+    for j in 1:QY, i in 1:(QX + 1)
+        dx[xface(i, j)] = i == 1 || i == QX + 1 ? 0.0 :
+            -(x[cell(i, j)] - x[cell(i - 1, j)]) / qx - x[xface(i, j)]
+    end
+    for j in 1:(QY + 1), i in 1:QX
+        dx[yface(i, j)] = j == 1 || j == QY + 1 ? 0.0 :
+            -(x[cell(i, j)] - x[cell(i, j - 1)]) / qy - x[yface(i, j)]
+    end
+    for j in 1:QY, i in 1:QX
+        dx[cell(i, j)] = -(
+            (x[xface(i + 1, j)] - x[xface(i, j)]) / qx + (x[yface(i, j + 1)] - x[yface(i, j)]) / qy
+        ) - x[cell(i, j)]^3
+    end
+    return nothing
+end
+
+function flow_jac_dm!(J, u, dm, t)
+    U = reshape_local_array(u, dm)
+    is, js = stag_points(dm)
+    for j in js, i in is
+        j <= QY && 1 < i <= QX && set_stencil_values!(
+            J, (LEFT, 1, i, j), ((ELEM, 1, i - 1, j), (ELEM, 1, i, j), (LEFT, 1, i, j)),
+            (1 / qx, -1 / qx, -1.0),
+        )
+        i <= QX && 1 < j <= QY && set_stencil_values!(
+            J, (DOWN, 1, i, j), ((ELEM, 1, i, j - 1), (ELEM, 1, i, j), (DOWN, 1, i, j)),
+            (1 / qy, -1 / qy, -1.0),
+        )
+        i <= QX && j <= QY && set_stencil_values!(
+            J, (ELEM, 1, i, j),
+            ((LEFT, 1, i, j), (RIGHT, 1, i, j), (DOWN, 1, i, j), (UP, 1, i, j), (ELEM, 1, i, j)),
+            (1 / qx, -1 / qx, 1 / qy, -1 / qy, -3U[ELEM, 1, i, j]^2),
+        )
+    end
+    return nothing
+end
+
+function flow_jac!(J, x, p, t)
+    for j in 1:QY, i in 2:QX
+        J[xface(i, j), cell(i - 1, j)], J[xface(i, j), cell(i, j)] = 1 / qx, -1 / qx
+        J[xface(i, j), xface(i, j)] = -1.0
+    end
+    for j in 2:QY, i in 1:QX
+        J[yface(i, j), cell(i, j - 1)], J[yface(i, j), cell(i, j)] = 1 / qy, -1 / qy
+        J[yface(i, j), yface(i, j)] = -1.0
+    end
+    for j in 1:QY, i in 1:QX
+        J[cell(i, j), xface(i, j)], J[cell(i, j), xface(i + 1, j)] = 1 / qx, -1 / qx
+        J[cell(i, j), yface(i, j)], J[cell(i, j), yface(i, j + 1)] = 1 / qy, -1 / qy
+        J[cell(i, j), cell(i, j)] = -3x[cell(i, j)]^2
+    end
+    return nothing
+end
+
+function flow_proto()
+    J = spzeros(NQ, NQ)
+    flow_jac!(J, ones(NQ), nothing, 0.0)
+    return sparse(1:NQ, 1:NQ, ones(NQ)) + abs.(J)
+end
+
+const flow0 = [k <= QX * QY ? sinpi(mod1(k, QX) * qx) * sinpi(cld(k, QX) * qy) : 0.0 for k in 1:NQ]
+
+function on_flow(x, dm)
+    u = zeros(PETScDiffEq._dm_local_size(pl, dm))
+    a = reshape_local_array(u, dm)
+    for j in axes(a, 2), i in axes(a, 1)
+        j <= QY && (a[LEFT, 1, i, j] = x[xface(i, j)])
+        i <= QX && (a[DOWN, 1, i, j] = x[yface(i, j)])
+        i <= QX && j <= QY && (a[ELEM, 1, i, j] = x[cell(i, j)])
+    end
+    return u
+end
+
+function flow_natural(u, dm)
+    x = zeros(NQ)
+    a = reshape_local_array(u, dm)
+    for j in axes(a, 2), i in axes(a, 1)
+        j <= QY && (x[xface(i, j)] = a[LEFT, 1, i, j])
+        i <= QX && (x[yface(i, j)] = a[DOWN, 1, i, j])
+        i <= QX && j <= QY && (x[cell(i, j)] = a[ELEM, 1, i, j])
+    end
+    return MPI.Reduce(x, +, comm; root = 0)
+end
+
+
+# Reaction-diffusion on a DMPlex box, coupling each vertex to its neighbours along the edges
+# or each cell to its neighbours across the edges, held in the mesh's coordinate order so the
+# distributed and serial meshes sum the same terms in the same order.
+const PLEX_FACES = (5, 4)
+const PLEX_K = 4.0
+
+plex_call(code) = PETScDiffEq._check_code(code)
+plex_sym(name) = PETScDiffEq._symbol(pl, name)
+
+# PETSc's 64-bit builds take Int64 indices.
+function plex_range(dm, name, k)
+    lo, hi = Ref(0), Ref(0)
+    plex_call(
+        ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}, Ptr{Int64}), dm.ptr, k, lo, hi),
+    )
+    return lo[]:(hi[] - 1)
+end
+
+function plex_adjacent(dm, p, size_name, name)
+    n, q = Ref(0), Ref{Ptr{Int64}}()
+    plex_call(ccall(plex_sym(size_name), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}), dm.ptr, p, n))
+    plex_call(ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Int64, Ptr{Ptr{Int64}}), dm.ptr, p, q))
+    return copy(unsafe_wrap(Array, q[], n[]))
+end
+plex_cone(dm, p) = plex_adjacent(dm, p, :DMPlexGetConeSize, :DMPlexGetCone)
+plex_support(dm, p) = plex_adjacent(dm, p, :DMPlexGetSupportSize, :DMPlexGetSupport)
+
+# PETSc distributes the box as DMSetFromOptions builds it.
+plex_mesh(c, simplex) = PETSc.DMPlex(
+    pl, c; dm_plex_dim = 2, dm_plex_simplex = simplex ? "1" : "0",
+    dm_plex_box_faces = join(PLEX_FACES, ","), dm_distribute_overlap = 1,
+)
+
+plex_set(name, s, p, k) =
+    plex_call(ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Int64, Int64), s, p, k))
+
+function plex_section!(dm, points, cells)
+    c, s, lo, hi = Ref{MPI.API.MPI_Comm}(), Ref{Ptr{Cvoid}}(), Ref(0), Ref(0)
+    plex_call(
+        ccall(plex_sym(:PetscObjectGetComm), Cint, (Ptr{Cvoid}, Ptr{MPI.API.MPI_Comm}), dm.ptr, c),
+    )
+    plex_call(
+        ccall(plex_sym(:PetscSectionCreate), Cint, (MPI.API.MPI_Comm, Ptr{Ptr{Cvoid}}), c[], s),
+    )
+    plex_call(
+        ccall(
+            plex_sym(:DMPlexGetChart), Cint, (Ptr{Cvoid}, Ptr{Int64}, Ptr{Int64}), dm.ptr, lo, hi,
+        ),
+    )
+    plex_set(:PetscSectionSetChart, s[], lo[], hi[])
+    for p in points
+        plex_set(:PetscSectionSetDof, s[], p, 1)
+    end
+    plex_call(ccall(plex_sym(:PetscSectionSetUp), Cint, (Ptr{Cvoid},), s[]))
+    plex_call(ccall(plex_sym(:DMSetLocalSection), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), dm.ptr, s[]))
+    plex_call(ccall(plex_sym(:PetscSectionDestroy), Cint, (Ptr{Ptr{Cvoid}},), s))
+    cells && plex_call(
+        ccall(plex_sym(:DMSetBasicAdjacency), Cint, (Ptr{Cvoid}, Cint, Cint), dm.ptr, 1, 0),
+    )
+    return nothing
+end
+
+plex_handle(name, obj) = (
+    h = Ref{Ptr{Cvoid}}();
+    plex_call(ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), obj, h)); h[]
+)
+
+function plex_xy(dm)
+    v = plex_handle(:DMGetCoordinatesLocal, dm.ptr)
+    s = plex_handle(:DMGetCoordinateSection, dm.ptr)
+    n, off, a = Ref(0), Ref(0), Ref{Ptr{Float64}}()
+    plex_call(ccall(plex_sym(:VecGetLocalSize), Cint, (Ptr{Cvoid}, Ptr{Int64}), v, n))
+    plex_call(ccall(plex_sym(:VecGetArrayRead), Cint, (Ptr{Cvoid}, Ptr{Ptr{Float64}}), v, a))
+    x = copy(unsafe_wrap(Array, a[], n[]))
+    plex_call(ccall(plex_sym(:VecRestoreArrayRead), Cint, (Ptr{Cvoid}, Ptr{Ptr{Float64}}), v, a))
+    return Dict(
+        map(plex_range(dm, :DMPlexGetDepthStratum, 0)) do p
+            plex_call(
+                ccall(
+                    plex_sym(:PetscSectionGetOffset), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}),
+                    s, p, off,
+                ),
+            )
+            p => (x[off[] + 1], x[off[] + 2])
+        end,
+    )
+end
+
+plex_key(x) = round.(x; digits = 9)
+
+# The points carrying the unknowns, where each sits, and its neighbours in coordinate order.
+function plex_layout(dm, cells)
+    xy = plex_xy(dm)
+    if cells
+        points = plex_range(dm, :DMPlexGetHeightStratum, 0)
+        corners(c) = unique(v for e in plex_cone(dm, c) for v in plex_cone(dm, e))
+        centre(c) = sum(v -> collect(xy[v]), corners(c)) ./ length(corners(c))
+        at = Dict(c => plex_key(centre(c)) for c in points)
+        across(c) = [x for e in plex_cone(dm, c) for x in plex_support(dm, e) if x != c]
+        near = Dict(c => across(c) for c in points)
+    else
+        points = plex_range(dm, :DMPlexGetDepthStratum, 0)
+        at = Dict(v => plex_key(collect(xy[v])) for v in points)
+        along(v) = [only(filter(!=(v), plex_cone(dm, e))) for e in plex_support(dm, v)]
+        near = Dict(v => along(v) for v in points)
+    end
+    return collect(points), at, Dict(p => sort(near[p]; by = q -> at[q]) for p in points)
+end
+
+function plex_problem(simplex, cells)
+    dm = plex_mesh(comm, simplex)
+    stratum = cells ? :DMPlexGetHeightStratum : :DMPlexGetDepthStratum
+    plex_section!(dm, plex_range(dm, stratum, 0), cells)
+    points, at, near = plex_layout(dm, cells)
+    probe = reshape_local_array(zeros(PETScDiffEq._dm_local_size(pl, dm)), dm)
+    own = [p for p in points if checkbounds(Bool, probe, 1, p)]
+    serial = plex_mesh(MPI.COMM_SELF, simplex)
+    spoints, sat, snear = plex_layout(serial, cells)
+    PETScCompat.destroy!(serial)
+    index = Dict(sat[p] => k for (k, p) in enumerate(spoints))
+    near_k = [[index[sat[q]] for q in snear[p]] for p in spoints]
+    n = length(spoints)
+    proto = sparse(
+        [k for k in 1:n for _ in 0:length(near_k[k])], reduce(vcat, [k; near_k[k]] for k in 1:n),
+        1.0, n, n,
+    )
+    u0 = zeros(length(own))
+    U0 = reshape_local_array(u0, dm)
+    start(x) = sinpi(x[1]) * cospi(x[2]) + 0.5
+    for p in own
+        U0[1, p] = start(at[p])
+    end
+    return (;
+        dm, own, near, slot = [index[at[p]] for p in own], u0, near_k, proto, n,
+        x0 = [start(sat[p]) for p in spoints],
+    )
+end
+
+function plex_natural(u, q)
+    x = zeros(q.n)
+    a = reshape_local_array(u, q.dm)
+    for (p, k) in zip(q.own, q.slot)
+        x[k] = a[1, p]
+    end
+    return MPI.Reduce(x, +, comm; root = 0)
+end
+
+function plex_rd_dm!(du, u, q, t)
+    U, D = reshape_local_array(u, q.dm), reshape_local_array(du, q.dm)
+    for p in q.own
+        s = 0.0
+        for x in q.near[p]
+            s += U[1, x] - U[1, p]
+        end
+        D[1, p] = PLEX_K * s - U[1, p]^3
+    end
+    return nothing
+end
+
+function plex_rd_jac_dm!(J, u, q, t)
+    U = reshape_local_array(u, q.dm)
+    for p in q.own
+        set_stencil_values!(J, (1, p), (1, p), -PLEX_K * length(q.near[p]) - 3U[1, p]^2)
+        for x in q.near[p]
+            set_stencil_values!(J, (1, p), (1, x), PLEX_K)
+        end
+    end
+    return nothing
+end
+
+function plex_rd!(du, u, q, t)
+    for k in eachindex(u)
+        s = 0.0
+        for j in q.near_k[k]
+            s += u[j] - u[k]
+        end
+        du[k] = PLEX_K * s - u[k]^3
+    end
+    return nothing
+end
+
+function plex_rd_jac!(J, u, q, t)
+    for k in eachindex(u)
+        J[k, k] = -PLEX_K * length(q.near_k[k]) - 3u[k]^2
+        for j in q.near_k[k]
+            J[k, j] = PLEX_K
+        end
+    end
+    return nothing
+end
+
 
 @testset "MPI DM, $nranks ranks" begin
     @testset "the algorithms take the DM's communicator" begin
@@ -515,6 +948,78 @@ end
         @test everywhere(got.u == ref.u)
     end
 
+    @testset "BrownFullBasicInit and ShampineCollocationInit with a DM" begin
+        algebraic(i) = i % 4 == 0
+        m = [algebraic(i) ? 0.0 : 1.0 for i in rows]
+        cubic(u, l, r) = u^3 + u - (l + r) / 2 - 0.1
+        function chain_dm!(du, u, da, t)
+            U, D = reshape_local_array(u, da), reshape_local_array(du, da)
+            for i in axes(D, 2)
+                l, c, r = U[1, i - 1], U[1, i], U[1, i + 1]
+                D[1, i] = algebraic(i) ? cubic(c, l, r) : l - 2c + r
+            end
+            return nothing
+        end
+        function chain_jac_dm!(J, u, da, gamma)
+            U = reshape_local_array(u, da)
+            for (k, i) in enumerate(rows)
+                c = U[1, i]
+                vals = algebraic(i) ? [-0.5, 3c^2 + 1, -0.5] : [1.0, -2.0, 1.0]
+                gamma === nothing || (vals = [0, gamma * m[k], 0] .- vals)
+                set_stencil_values!(J, (1, i), [(1, i - 1), (1, i), (1, i + 1)], vals)
+            end
+            return nothing
+        end
+        function chain!(du, u, p, t)
+            left, right = halo(u)
+            for (k, i) in enumerate(rows)
+                l = k == 1 ? left : u[k - 1]
+                r = k == length(u) ? right : u[k + 1]
+                du[k] = algebraic(i) ? cubic(u[k], l, r) : l - 2u[k] + r
+            end
+            return nothing
+        end
+        residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= m .* du .- r; nothing)
+        ode_jac_dm!(J, u, da, t) = chain_jac_dm!(J, u, da, nothing)
+        dae_jac_dm!(J, du, u, da, gamma, t) = chain_jac_dm!(J, u, da, gamma)
+        function problems(form; jac)
+            if form == :dae
+                fn = jac ? DAEFunction(residual(chain_dm!); jac = dae_jac_dm!) :
+                    DAEFunction(residual(chain_dm!))
+                plain = DAEFunction(residual(chain!); jac_prototype = heat_proto(rows))
+                dv = m .!= 0
+                with_dm = DAEProblem(fn, zero(m), heat0(rows), SPAN, da; differential_vars = dv)
+                without = DAEProblem(plain, zero(m), heat0(rows), SPAN; differential_vars = dv)
+                return with_dm, without
+            end
+            fn = jac ? ODEFunction(chain_dm!; jac = ode_jac_dm!, mass_matrix = Diagonal(m)) :
+                ODEFunction(chain_dm!; mass_matrix = Diagonal(m))
+            return ODEProblem(fn, heat0(rows), SPAN, da),
+                comm_heat(chain!; mass_matrix = Diagonal(m))
+        end
+        method(form; kw...) = form == :dae ? TSDAE("bdf"; kw...) : TSImplicit("bdf"; kw...)
+        for form in (:mass, :dae), jac in (true, false),
+                ia in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            with_dm, without = problems(form; jac)
+            @test caught(() -> solve(with_dm, method(form; dm = da, comm); TOL...)) isa
+                SciMLBase.CheckInitFailureError
+            got = solve(with_dm, method(form; dm = da, comm); initializealg = ia, TOL...)
+            ref = solve(without, method(form; comm); initializealg = ia, TOL...)
+            @test got.retcode == ref.retcode == ReturnCode.Success
+            @test anywhere(maximum(abs, got.u[1] - heat0(rows)) > 0.1)
+            @test everywhere(maximum(abs, got.u[1] - ref.u[1]) <= INIT_GAP)
+            integ = init(with_dm, method(form; dm = da, comm); initializealg = ia, TOL...)
+            SciMLBase.set_u!(integ, integ.u .+ 0.05)
+            SciMLBase.initialize_dae!(integ)
+            plain = init(without, method(form; comm); initializealg = ia, TOL...)
+            SciMLBase.set_u!(plain, plain.u .+ 0.05)
+            SciMLBase.initialize_dae!(plain)
+            @test everywhere(maximum(abs, integ.u - plain.u) <= INIT_GAP)
+            terminate!(integ)
+            terminate!(plain)
+        end
+    end
+
     @testset "a jac fills the DM's matrix" begin
         stencil(i) = ([(1, i - 1), (1, i), (1, i + 1)], [1, -2, 1] ./ dx^2)
         njac = Ref(0)
@@ -716,6 +1221,12 @@ end
         end
         e = caught(() -> solve(dm_heat(; jac = throwing_jac!), bdf(; dm = da); TOL...))
         @test raised(e, "jac threw")
+
+        never(J, u, da, t) = error("an explicit solve called its jac")
+        @test everywhere(
+            solve(dm_heat(; jac = never), explicit(; dm = da); FIXED...).u ==
+                solve(dm_heat(), explicit(; dm = da); FIXED...).u,
+        )
         @test everywhere(refs(da.ptr) == 1)
     end
 
@@ -741,10 +1252,6 @@ end
         for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("alpha"; dm = da))
             @test refused(() -> solve(prob, alg; dt = 1.0e-3), "cannot run")
         end
-        @test refused(
-            () -> solve(dm_heat(; jac = (J, u, p, t) -> nothing), explicit(; dm = da)),
-            "does not take a `jac`",
-        )
         @test refused(
             () -> solve(
                 ODEProblem(
@@ -775,10 +1282,11 @@ end
         )
         @test refused(
             () -> PETScDiffEq._discrete_adjoint(
-                prob, TSRK("4"; dm = da), PETScAdjoint(); t = [0.1],
+                ODEProblem((du, u, p, t) -> heat_dm!(du, u, da, t), heat0(rows), SPAN),
+                TSRK("4"; dm = da), PETScAdjoint(); t = [0.1],
                 dgdu_discrete = (out, u, p, t, i) -> (out .= u), dt = 0.01, adaptive = false,
             ),
-            "PETScAdjoint",
+            "PETScAdjoint needs the ODEFunction's `jac` with a `dm`",
         )
         shell = LibPETSc.DMShellCreate(pl, comm)
         @test refused(
@@ -818,6 +1326,288 @@ end
         PETScCompat.destroy!(da32)
     end
 
+    @testset "a DMStag: f, jac and the rest by staggered point" begin
+        direct = ["-ksp_type", "preonly", "-pc_type", "redundant"]
+        bdf(; kw...) = TSImplicit("bdf", direct; kw...)
+        rosw(; kw...) = TSRosW("ra34pw2", direct; kw...)
+        damping = [1.0, 1.0]
+        u0 = on_wave(wave0, stag)
+        back = wave_natural(u0, stag)
+        rank == 0 && @test back == wave0
+        first_cell = sum(uneven(NS)[1:rank]) + 1
+        @test stag_points(stag)[1] ==
+            first_cell:(first_cell + uneven(NS)[rank + 1] - (rank == nranks - 1 ? 0 : 1))
+        dm_wave(; kw...) = ODEProblem(ODEFunction(wave_dm!; kw...), u0, SPAN, damping)
+        serial_wave(; kw...) = ODEProblem(
+            ODEFunction(wave!; jac_prototype = wave_proto, kw...), wave0, SPAN, damping,
+        )
+
+        halve = DiscreteCallback((u, t, i) -> t == 0.05, i -> (i.u .*= 0.5))
+        events = (; saveat = 0.02, callback = halve, tstops = [0.05], FIXED...)
+        got = solve(dm_wave(), explicit(; dm = stag); events...)
+        @test got.retcode == ReturnCode.Success
+        us = wave_natural.(got.u, Ref(stag))
+        if rank == 0
+            ref = solve(serial_wave(), explicit(); events...)
+            @test got.t == ref.t
+            @test us == ref.u
+        end
+
+        for make in (bdf, rosw)
+            got = solve(dm_wave(; jac = wave_jac_dm!), make(; dm = stag); saveat = 0.02, TOL...)
+            coloured = solve(dm_wave(), make(; dm = stag); saveat = 0.02, TOL...)
+            @test got.retcode == coloured.retcode == ReturnCode.Success
+            @test got.stats.njacs > 0
+            @test coloured.stats.njacs == 0
+            @test got.stats.nf < coloured.stats.nf
+            @test same_everywhere(got.stats.nf)
+            us, cs = wave_natural.(got.u, Ref(stag)), wave_natural.(coloured.u, Ref(stag))
+            if rank == 0
+                ref = solve(serial_wave(; jac = wave_jac!), make(); saveat = 0.02, TOL...)
+                @test maxdiff(us, ref.u) <= STAG_SERIAL_TOL
+                @test maxdiff(cs, us) <= COLOUR_TOL
+            end
+        end
+
+        weights = 1 .+ (1:NW) ./ NW
+        got = solve(
+            dm_wave(; jac = wave_jac_dm!, mass_matrix = Diagonal(on_wave(weights, stag))),
+            bdf(; dm = stag); saveat = 0.02, TOL...,
+        )
+        us = wave_natural.(got.u, Ref(stag))
+        if rank == 0
+            ref = solve(
+                serial_wave(; jac = wave_jac!, mass_matrix = Diagonal(weights)), bdf();
+                saveat = 0.02, TOL...,
+            )
+            @test maxdiff(us, ref.u) <= STAG_SERIAL_TOL
+        end
+
+        tight = ["-snes_rtol", "1e-13", "-snes_atol", "1e-15", direct...]
+        function sink_dm!(du, u, p, t)
+            U, D = reshape_local_array(u, stag), reshape_local_array(du, stag)
+            for i in axes(D, 1)
+                D[LEFT, 1, i] = 0.0
+                i <= NS && (D[ELEM, 1, i] = -0.5 * U[ELEM, 1, i])
+            end
+            return nothing
+        end
+        sink!(dx, x, p, t) = (dx .= ifelse.(isodd.(1:NW), 0.0, -0.5 .* x); nothing)
+        got = solve(
+            SplitODEProblem(wave_dm!, sink_dm!, u0, SPAN, damping),
+            TSARKIMEX("3", tight; dm = stag); saveat = 0.02, TOL...,
+        )
+        us = wave_natural.(got.u, Ref(stag))
+        residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
+        dwave0 = similar(wave0)
+        wave!(dwave0, wave0, damping, 0.0)
+        dae = solve(
+            DAEProblem(residual(wave_dm!), on_wave(dwave0, stag), u0, SPAN, damping),
+            TSDAE("bdf", tight; dm = stag); saveat = 0.02, TOL...,
+        )
+        ds = wave_natural.(dae.u, Ref(stag))
+        @test got.retcode == dae.retcode == ReturnCode.Success
+        if rank == 0
+            stiff = ODEFunction(wave!; jac_prototype = wave_proto)
+            ref = solve(
+                SplitODEProblem(stiff, sink!, wave0, SPAN, damping), TSARKIMEX("3", tight);
+                saveat = 0.02, TOL...,
+            )
+            @test maxdiff(us, ref.u) <= STAG_SERIAL_TOL
+            fn = DAEFunction(residual(wave!); jac_prototype = wave_proto)
+            ref = solve(
+                DAEProblem(fn, dwave0, wave0, SPAN, damping), TSDAE("bdf", tight);
+                saveat = 0.02, TOL...,
+            )
+            @test maxdiff(ds, ref.u) <= STAG_SERIAL_TOL
+        end
+
+        function walk(integ, gather)
+            seen = map(1:20) do _
+                step!(integ)
+                gather.((integ.u, integ((integ.tprev + integ.t) / 2), get_du(integ)))
+            end
+            terminate!(integ)
+            return seen
+        end
+        integ = init(dm_wave(; jac = wave_jac_dm!), bdf(; dm = stag); FIXED...)
+        ts_dm = held(PETScDiffEq._ts_dm(pl, integ.h.ts))
+        @test PETScDiffEq._dm_type(pl, LibPETSc.PetscDM(ts_dm, pl)) == "stag"
+        seen = walk(integ, u -> wave_natural(u, stag))
+        @test everywhere(released(ts_dm))
+        if rank == 0
+            ref = walk(init(serial_wave(; jac = wave_jac!), bdf(); FIXED...), copy)
+            @test maximum(maxdiff(a, b) for (a, b) in zip(seen, ref)) <= STAG_STEP_TOL
+        end
+
+        # The flux on each end is pinned to 0.1, which the initial state misses.
+        function pinned_dm!(du, u, p, t)
+            wave_dm!(du, u, p, t)
+            U, D = reshape_local_array(u, stag), reshape_local_array(du, stag)
+            for i in intersect(axes(D, 1), (1, NS + 1))
+                D[LEFT, 1, i] = 0.1 - U[LEFT, 1, i]
+            end
+            return nothing
+        end
+        function pinned!(dx, x, p, t)
+            wave!(dx, x, p, t)
+            dx[1], dx[NW] = 0.1 - x[1], 0.1 - x[NW]
+            return nothing
+        end
+        m = [k in (1, NW) ? 0.0 : 1.0 for k in 1:NW]
+        for ia in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            got = solve(
+                ODEProblem(
+                    ODEFunction(pinned_dm!; mass_matrix = Diagonal(on_wave(m, stag))), u0, SPAN,
+                    damping,
+                ),
+                bdf(; dm = stag); initializealg = ia, TOL...,
+            )
+            @test got.retcode == ReturnCode.Success
+            start = wave_natural(got.u[1], stag)
+            if rank == 0
+                fn = ODEFunction(pinned!; jac_prototype = wave_proto, mass_matrix = Diagonal(m))
+                ref = solve(
+                    ODEProblem(fn, wave0, SPAN, damping), bdf(); initializealg = ia, TOL...,
+                )
+                @test maximum(abs, start[[1, NW]] .- 0.1) <= INIT_GAP
+                @test maximum(abs, start - ref.u[1]) <= INIT_GAP
+            end
+        end
+
+        cost = (out, u, p, t, i) -> (out .= u; nothing)
+        exact = ["-snes_rtol", "1e-13", "-snes_atol", "1e-15", "-ksp_type", "preonly"]
+        for make in (
+                (c; kw...) -> TSRK("4"; kw...),
+                (c; kw...) -> TSImplicit(
+                    "cn", [exact; "-pc_type"; c == MPI.COMM_SELF ? "lu" : "redundant"]; kw...,
+                ),
+            )
+            fn = ODEFunction(wave_dm!; jac = wave_jac_dm!, paramjac = wave_paramjac_dm!)
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                ODEProblem(fn, u0, (0.0, 0.05), [0.7, 1.3]), make(comm; dm = stag), PETScAdjoint();
+                t = [0.0, 0.025, 0.05], dgdu_discrete = cost, dt = 1.0e-3, adaptive = false,
+            )
+            @test same_everywhere(dp)
+            mine = vcat(wave_natural(du0, stag), vec(dp))
+            if rank == 0
+                fn = ODEFunction(
+                    wave!; jac = wave_jac!, paramjac = wave_paramjac!, jac_prototype = wave_proto,
+                )
+                sdu0, sdp = PETScDiffEq._discrete_adjoint(
+                    ODEProblem(fn, wave0, (0.0, 0.05), [0.7, 1.3]), make(MPI.COMM_SELF),
+                    PETScAdjoint();
+                    t = [0.0, 0.025, 0.05], dgdu_discrete = cost, dt = 1.0e-3, adaptive = false,
+                )
+                ref = vcat(sdu0, vec(sdp))
+                @test maximum(abs, mine - ref) / maximum(abs, ref) <= STAG_ADJOINT_GAP
+            end
+        end
+
+        for (processors, stencil) in (
+                ((nranks, 1), LibPETSc.DMSTAG_STENCIL_BOX),
+                ((1, nranks), LibPETSc.DMSTAG_STENCIL_STAR),
+            )
+            plane = PETSc.DMStag(
+                pl, comm, (GHOSTED, GHOSTED), (QX, QY), (0, 1, 1), 1, stencil; processors,
+            )
+            span = (0.0, 0.05)
+            v0 = on_flow(flow0, plane)
+            got = solve(
+                ODEProblem(flow_dm!, v0, span, plane), explicit(; dm = plane);
+                saveat = 0.01, FIXED...,
+            )
+            us = flow_natural.(got.u, Ref(plane))
+            if rank == 0
+                ref = solve(ODEProblem(flow!, flow0, span), explicit(); saveat = 0.01, FIXED...)
+                @test got.t == ref.t
+                @test us == ref.u
+            end
+            got = solve(
+                ODEProblem(ODEFunction(flow_dm!; jac = flow_jac_dm!), v0, span, plane),
+                bdf(; dm = plane); saveat = 0.01, TOL...,
+            )
+            coloured = solve(
+                ODEProblem(flow_dm!, v0, span, plane), bdf(; dm = plane); saveat = 0.01, TOL...,
+            )
+            @test got.retcode == coloured.retcode == ReturnCode.Success
+            @test got.stats.nf < coloured.stats.nf
+            us, cs = flow_natural.(got.u, Ref(plane)), flow_natural.(coloured.u, Ref(plane))
+            if rank == 0
+                ref = solve(
+                    ODEProblem(
+                        ODEFunction(flow!; jac = flow_jac!, jac_prototype = flow_proto()), flow0,
+                        span,
+                    ),
+                    bdf(); saveat = 0.01, TOL...,
+                )
+                @test maxdiff(us, ref.u) <= STAG_SERIAL_TOL
+                @test maxdiff(cs, us) <= COLOUR_TOL
+            end
+            PETScCompat.destroy!(plane)
+        end
+        @test everywhere(refs(stag.ptr) == 1)
+    end
+
+    @testset "a DMPlex: f and jac by mesh point" begin
+        direct = ["-ksp_type", "preonly", "-pc_type", "redundant"]
+        bdf(; kw...) = TSImplicit("bdf", direct; kw...)
+        rosw(; kw...) = TSRosW("ra34pw2", direct; kw...)
+        for (simplex, cells) in ((true, false), (false, true))
+            q = plex_problem(simplex, cells)
+            back = plex_natural(q.u0, q)
+            rank == 0 && @test back == q.x0
+            dm_rd(; kw...) = ODEProblem(ODEFunction(plex_rd_dm!; kw...), q.u0, SPAN, q)
+            serial_rd(; kw...) = ODEProblem(
+                ODEFunction(plex_rd!; jac_prototype = q.proto, kw...), q.x0, SPAN, q,
+            )
+            got = solve(dm_rd(), explicit(; dm = q.dm); saveat = 0.02, FIXED...)
+            @test got.retcode == ReturnCode.Success
+            us = plex_natural.(got.u, Ref(q))
+            if rank == 0
+                ref = solve(serial_rd(), explicit(); saveat = 0.02, FIXED...)
+                @test got.t == ref.t
+                @test us == ref.u
+            end
+            for make in (bdf, rosw)
+                got = solve(
+                    dm_rd(; jac = plex_rd_jac_dm!), make(; dm = q.dm); saveat = 0.02, TOL...,
+                )
+                coloured = solve(dm_rd(), make(; dm = q.dm); saveat = 0.02, TOL...)
+                @test got.retcode == coloured.retcode == ReturnCode.Success
+                @test got.stats.njacs > 0
+                @test coloured.stats.njacs == 0
+                @test got.stats.nf < coloured.stats.nf
+                @test same_everywhere(got.stats.nf)
+                us, cs = plex_natural.(got.u, Ref(q)), plex_natural.(coloured.u, Ref(q))
+                if rank == 0
+                    ref = solve(serial_rd(; jac = plex_rd_jac!), make(); saveat = 0.02, TOL...)
+                    @test maxdiff(us, ref.u) <= PLEX_SERIAL_TOL
+                    @test maxdiff(cs, us) <= PLEX_COLOUR_TOL
+                end
+            end
+            function walk(integ, gather)
+                seen = map(1:20) do _
+                    step!(integ)
+                    gather.((integ.u, integ((integ.tprev + integ.t) / 2), get_du(integ)))
+                end
+                terminate!(integ)
+                return seen
+            end
+            integ = init(dm_rd(; jac = plex_rd_jac_dm!), bdf(; dm = q.dm); FIXED...)
+            ts_dm = held(PETScDiffEq._ts_dm(pl, integ.h.ts))
+            @test PETScDiffEq._dm_type(pl, LibPETSc.PetscDM(ts_dm, pl)) == "plex"
+            seen = walk(integ, u -> plex_natural(u, q))
+            @test everywhere(released(ts_dm))
+            if rank == 0
+                ref = walk(init(serial_rd(; jac = plex_rd_jac!), bdf(); FIXED...), copy)
+                @test maximum(maxdiff(a, b) for (a, b) in zip(seen, ref)) <= PLEX_STEP_TOL
+            end
+            @test everywhere(refs(q.dm.ptr) == 1)
+            PETScCompat.destroy!(q.dm)
+        end
+    end
+
     @testset "every handle is freed" begin
         @test isempty(PETScDiffEq.PARALLEL_HANDLES)
         @test all(h -> h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
@@ -825,3 +1615,4 @@ end
 end
 
 PETScCompat.destroy!(da)
+PETScCompat.destroy!(stag)

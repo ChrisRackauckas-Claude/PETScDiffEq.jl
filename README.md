@@ -1,6 +1,12 @@
 # PETScDiffEq.jl
 
+[![Join the chat at https://julialang.zulipchat.com #sciml-bridged](https://img.shields.io/static/v1?label=Zulip&message=chat&color=9558b2&labelColor=389826)](https://julialang.zulipchat.com/#narrow/stream/279055-sciml-bridged)
+[![Global Docs](https://img.shields.io/badge/docs-SciML-blue.svg)](https://docs.sciml.ai/PETScDiffEq/stable/)
+
 [![CI](https://github.com/SciML/PETScDiffEq.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/SciML/PETScDiffEq.jl/actions/workflows/CI.yml)
+
+[![ColPrac: Contributor's Guide on Collaborative Practices for Community Packages](https://img.shields.io/badge/ColPrac-Contributor%27s%20Guide-blueviolet)](https://github.com/SciML/ColPrac)
+[![SciML Code Style](https://img.shields.io/static/v1?label=code%20style&message=SciML&color=9558b2&labelColor=389826)](https://github.com/SciML/SciMLStyle)
 
 This package contains bindings for the [PETSc](https://petsc.org) TS time integrators to
 allow them to be used with the SciML common interface. PETSc's linear and nonlinear
@@ -8,6 +14,9 @@ solvers are already reachable from SciML through LinearSolve.jl and NonlinearSol
 this package covers the third layer, TS. For more information on using the solvers from
 this package, see the
 [DifferentialEquations.jl documentation](https://docs.sciml.ai/DiffEqDocs/stable/).
+
+The documentation of this package is at
+[docs.sciml.ai/PETScDiffEq](https://docs.sciml.ai/PETScDiffEq/stable/).
 
 ## Installation
 
@@ -228,8 +237,13 @@ cubic Hermite interpolant of the velocity and the position, which is also what O
 gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`, or of the whole system,
 and `stats.nf2` those of `f2` alone.
 
-These problems run on `MPI.COMM_SELF` only, take no mass matrix and no `PETScAdjoint`, and
-`TSAlpha2` does not integrate backward in time.
+These problems take no mass matrix. They run distributed over a `comm` as the MPI section
+describes, though not with a `dm`. Both algorithms take a reversed `tspan`. PETSc only steps
+forward, so `TSAlpha2` then integrates `w(s) = u(-s)`, whose velocity is `-u'`, and gives back
+`u'`: the states, `jac` and callbacks are those of the problem as written. `PETScAdjoint`
+differentiates them through the first-order form with `TSRK`, `TSARKIMEX` or `TSImplicit`'s
+`"beuler"`, `"cn"` or `"theta"`, on `MPI.COMM_SELF` only; PETSc has no adjoint for
+`TSBasicSymplectic` or `TSAlpha2`.
 
 ## DAE initialization
 
@@ -237,9 +251,12 @@ A `DAEProblem`, or an `ODEProblem` whose mass matrix has zero rows and columns, 
 where its algebraic equations hold. The `initializealg` keyword picks how, with the algorithms
 OrdinaryDiffEq takes, which come from DiffEqBase:
 
-- `CheckInit()`, the default, evaluates the residual at `u0`, and at `du0` for a
-  `DAEProblem`, and throws a `CheckInitFailureError` when its RMS norm exceeds `abstol`,
-  taken per component when `abstol` is a vector.
+- `CheckInit()`, the default for a problem without initialization data, evaluates the
+  residual at `u0`, and at `du0` for a `DAEProblem`, and throws a `CheckInitFailureError`
+  when its RMS norm exceeds `abstol`, taken per component when `abstol` is a vector.
+- `OverrideInit()`, the default for a problem that carries initialization data, as
+  ModelingToolkit's do, solves the problem's own initialization system and takes the state
+  and the parameters it gives. On a problem without such data it does nothing.
 - `BrownFullBasicInit()` keeps the differential variables and solves for the algebraic
   ones, and for a `DAEProblem` also for the derivatives of the differential ones, which
   needs `differential_vars`. Its own `abstol`, `1e-10` unless given, decides whether to
@@ -257,20 +274,48 @@ The two that solve use PETSc's SNES with the Jacobian the solve itself uses: the
 `jac`, the ForwardDiff one or PETSc's finite differences, sparse under a `jac_prototype`. So
 they take no `nlsolve`, and when SNES fails the solve returns at `t0` with
 `ReturnCode.InitialFailure`. A start that already passes the check is left untouched, and
-`reinit!` initializes again unless given `reinit_dae = false`. They do not run on a
-communicator other than `MPI.COMM_SELF`, where `CheckInit()` still checks the whole state.
+`reinit!` initializes again unless given `reinit_dae = false`.
 
-The default is `CheckInit()` even for a problem carrying ModelingToolkit's initialization
-data, which OrdinaryDiffEq would solve with `OverrideInit()`; this package does not solve that
-system and refuses `OverrideInit()` on such a problem.
+On a communicator other than `MPI.COMM_SELF` they run wherever they run serially, and SNES
+solves the whole state on the communicator, each rank its own rows, with the distributed
+Jacobian of the solve: the problem's `jac` filling this rank's rows of the sparse
+`jac_prototype`, or PETSc's colouring of that prototype, and with a `dm` the DM's colouring,
+whether or not the problem has a `jac`. Its linear solves are GMRES with block Jacobi, one
+ILU(0) block on each rank, to a relative tolerance of the square root of the precision's
+spacing, and the solve's `petsc_options` do not reach them. A row `BrownFullBasicInit()` does
+not solve keeps its variable there, so it takes a mass matrix whose zero columns are its zero
+rows, as a `Diagonal` one's are, and refuses a sparse one where they differ. When SNES fails
+the solve returns at `t0` with `ReturnCode.InitialFailure` on every rank, and an `f` or `jac`
+that throws on some ranks makes every rank throw, as in a solve.
+
+`OverrideInit()` goes through SciMLBase's `get_initial_values`, as OrdinaryDiffEq's does, and
+PETSc's SNES solves the initialization system with a finite-difference Jacobian, to the
+solve's `abstol` unless `OverrideInit(; abstol)` gives its own, so no solver package has to
+be loaded. SNES takes a `NonlinearProblem`, and a `NonlinearLeastSquaresProblem` with as many
+equations as unknowns. An `SCCNonlinearProblem`, which ModelingToolkit builds for a fully
+determined system, goes block by block through SCCNonlinearSolve, which ModelingToolkit
+loads: SNES solves the nonlinear blocks and LinearSolve the linear ones. A system with more
+or fewer equations than unknowns, which ModelingToolkit warns about, is refused, as is any
+other kind of initialization problem; `OverrideInit(; nlsolve = alg)` hands the system to
+that solver instead, for those a least-squares one from NonlinearSolve. When the solver
+fails the solve returns at `t0` with `ReturnCode.InitialFailure`.
+
+The parameters the initialization gives are the ones the solve uses, and the ones in
+`sol.prob.p` and `integrator.p`. It runs where OrdinaryDiffEq runs it: at `init` and `solve`,
+on an `ODEProblem` without a mass matrix too, in `reinit!`, in `initialize_dae!`, and after
+a callback on a `DAEProblem` or a mass-matrix problem. The problem's hooks are given the
+problem at `init`, `solve` and `reinit!` and the integrator afterwards. No check follows it,
+as none does in OrdinaryDiffEq. It does not run on a communicator other than
+`MPI.COMM_SELF`, and `PETScAdjoint` does not differentiate it; `initializealg = CheckInit()`
+starts both from the values as given.
 
 `initialize_dae!(integrator, initializealg)` runs the same on the integrator's current state
 and time, with the `initializealg` the solve was given unless another is passed, and writes
 the result into PETSc. It takes `du0` from the problem for a `DAEProblem`, the current
 `abstol` and, for `ShampineCollocationInit()` on an `ODEProblem`, the current `dt / 5`, as
 OrdinaryDiffEq's does. When SNES fails the integrator finishes where it is with
-`ReturnCode.InitialFailure`, and on an `ODEProblem` without a singular mass matrix it does
-nothing. After a callback's `affect!` runs without calling
+`ReturnCode.InitialFailure`, and on an `ODEProblem` without a singular mass matrix only
+`OverrideInit()` does anything. After a callback's `affect!` runs without calling
 `derivative_discontinuity!(integrator, false)`, or its `initialize` calls
 `derivative_discontinuity!(integrator, true)`, the integrator is initialized again with the
 callback's `initializealg`, or the solve's when the callback has none, as OrdinaryDiffEq does.
@@ -335,8 +380,10 @@ checked. The explicit methods take any `f`.
 ## Adjoint sensitivities
 
 With SciMLSensitivity loaded, `adjoint_sensitivities(sol, alg; sensealg = PETScAdjoint(), ...)`
-runs PETSc's own discrete adjoint for `TSRK`, `TSImplicit("beuler")` and `TSImplicit("cn")`,
-for discrete costs, integral costs through PETSc's quadrature `TS`, or both. The keywords
+runs PETSc's own discrete adjoint for `TSRK`, `TSARKIMEX` and `TSImplicit`'s `"beuler"`,
+`"cn"` and `"theta"`, for discrete costs, integral costs through PETSc's quadrature `TS`, or
+both; `TSARKIMEX` takes a `SplitODEProblem` too, and discrete costs only. It runs
+distributed over a `comm` and on a DMDA as well, as the MPI section describes. The keywords
 that set the steps have to be repeated from `solve`. It runs in PETSc's double
 real build, so a `Float32` problem is differentiated in `Float64` and its gradients come
 back as `Float32`, and a complex one is refused. `?PETScAdjoint` and the documentation cover
@@ -366,7 +413,7 @@ x = (8rank .+ (1:8)) .* dx
 function heat!(du, u, p, t)
     left = rank == 0 ? MPI.PROC_NULL : rank - 1
     right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
-    gl, gr = zeros(1), zeros(1)
+    gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
     MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
     MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
     for i in eachindex(u)
@@ -440,11 +487,36 @@ sol = solve(ODEProblem(f, sinpi.(x), (0.0, 0.1)), TSImplicit("bdf"; comm))
 
 Without a `jac`, `autodiff` defaults to `AutoFiniteDiff()` on such a `comm`: PETSc colours the
 prototype's pattern and differences `f`, calling it the same number of times on every rank.
-ForwardDiff and the other `autodiff` backends are refused there, since the number of times
-they call `f` differs between ranks. So are a `jac` or colouring without a sparse prototype,
-a mass matrix other than a `Diagonal` of this rank's entries, and `TSIRK` without a `jac`.
-`TSIRK` also needs each rank to hold PETSc's own share of the state, split evenly with the
-first ranks taking one row more, since PETSc lays out its stage vector that way.
+`autodiff = AutoForwardDiff()`, alone or in an `AutoSparse`, has ForwardDiff differentiate `f`
+instead. At the start rank 0 gathers every rank's rows of the prototype, colours the columns of
+the whole pattern and sends the colours back, and each rank seeds its own block of the state
+with them. Every rank then calls `f` once per chunk of colours, and the dual numbers `f` sends
+in its halo exchange carry the other ranks' share of each derivative, so `f`'s buffers have to
+take `u`'s element type, as `zeros(eltype(u), 1)` above does. With `zeros(1)` the rank that
+receives a dual number throws in the middle of the exchange and the ranks hang, which is one
+reason it is not the default. On 1 to 3 ranks, including one holding no rows, the Jacobians of
+the heat equation and of a Brusselator matched those of a serial ForwardDiff solve and of a
+hand-written `jac` bit for bit, and the solves matched the `jac`'s exactly. Nor is it reliably
+cheaper on a stiff problem: on twelve Robertson cells coupled by diffusion, with `"bdf"` at
+`abstol = 1e-10` and `reltol = 1e-6`, it took at most the colouring's Newton iterations to
+t = 1e5 with a third of the calls to `f`, but to t = 1e11 it took 31% fewer on one rank and 47%
+more on three. Other backends are refused there, since `f` would have to carry their derivatives
+through its own communication. So are a `jac`, PETSc's colouring or ForwardDiff without a sparse
+prototype, a dense mass matrix, and `TSIRK` without a `jac` or `AutoForwardDiff()`.
+
+A mass matrix is a `Diagonal` of this rank's entries, or a sparse matrix holding this rank's
+rows with global column indices, as the prototype does, such as a finite element mass
+matrix. PETSc assembles a sparse one into a distributed matrix, and its pattern joins the
+prototype's in the Jacobian `a*M - J` of the implicit solve. A rank whose rows of the mass
+matrix are the identity can leave it as `I`, whatever the other ranks give.
+`TSIRK` takes any split of the state. PETSc lays out its stage vector by its own even split,
+the first ranks taking one row more, so on any other split the solve runs on that one and
+moves the state to and from each rank's block around every call to `f` and `jac`, which, like
+`sol.u` and the callbacks, still see the rank's own block. On 2 and 3 ranks, one of them
+holding no rows in some splits, a heat equation and a stiff reaction-diffusion problem gave the
+states of the solve on PETSc's own split bit for bit from the same initial values, and the
+serial solve's to 3e-15 with `-ksp_rtol 1e-14`. On up to 24,000 rows the moves, 12 to 37 a
+step, took 7% to 23% of the solve's time.
 
 PETSc solves the linear systems of a distributed solve with GMRES and block Jacobi, one
 ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agrees with a
@@ -458,19 +530,41 @@ implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`
 refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
 takes other steps than a serial solve and ends with another error, larger or smaller.
 
-`PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
-`TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
-prototype as above, and when there are parameters a `paramjac` filling this rank's rows,
-since automatic differentiation would call `f` a different number of times on each rank; both
+A `DynamicalODEProblem` or `SecondOrderODEProblem` runs distributed as well, with
+`TSBasicSymplectic`, `TSAlpha2` or any algorithm above on its first-order form. Each rank's
+`ArrayPartition(v, u)` holds its block of the velocity and its block of the position, each
+following the other ranks' blocks of the same part in rank order, and the states it gets back,
+in `sol.u`, `integrator.u`, callbacks and `unstable_check`, are such blocks too; `save_idxs` and
+vector tolerances index this rank's `[v; u]`. `f1` and `f2` see only those blocks and are
+collective like `f`, and a rank runs both even when the first throws. A `jac_prototype` holds
+this rank's rows of the first-order system's Jacobian, its `v` rows and then its `u` rows,
+with the columns a serial solve gives them, the whole velocity before the whole position, so
+it is `length(u0)` by the length of the whole state, and `jac` fills it as it would those rows
+of the serial Jacobian. `TSAlpha2` needs each rank's `v` and `u` to have the same
+length, and builds the distributed matrix it factors, `shift_a I - shift_v df/dv - df/du`,
+from the `v` rows; without a `jac` PETSc colours that matrix and differences `f`, as for the
+other implicit algorithms. A `dm` is refused for these problems, and so are `PETScAdjoint` and
+any `autodiff` but `AutoFiniteDiff()` on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
+chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
+steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
+`TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
+"-pc_type", "redundant"]` in `petsc_options` and to 8e-8 with the default linear solver, and
+colouring, whose differences depend on the layout, moved `TSAlpha2` by up to 3e-6.
+
+`PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` on an `ODEProblem` and
+`TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It needs the problem's `jac`, filling this
+rank's rows of a sparse prototype as above, and when there are parameters a `paramjac`
+filling this rank's rows, since it builds neither by automatic differentiation there; both
 are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
-ignores it there. `dgdu_discrete` gets this rank's rows of the state and writes their
-gradient, and `dgdp_discrete` gives this rank's share of the cost's direct derivative with
-respect to `p`, which the ranks add up. `du0` comes back as this rank's rows and `dp` as the
-whole gradient, the same on every rank. The cost times, `no_start`, the length of `p` and
-whether `dgdp_discrete` is given have to agree across the ranks. A `jac`, `paramjac`, cost
-function or `f` that throws on some ranks makes every rank throw, as in a solve. The
-transposed linear solves of `TSImplicit` use the solver above;
-`["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
+ignores it there. `dgdu_discrete` gets this rank's rows of the
+state and writes their gradient, and `dgdp_discrete` gives this rank's share of the cost's
+direct derivative with respect to `p`, which the ranks add up. `du0` comes back as this
+rank's rows and `dp` as the whole gradient, the same on every rank. The cost times,
+`no_start`, the length of `p` and whether `dgdp_discrete` is given have to agree across the
+ranks. A `jac`, `paramjac`, cost function or `f` that throws on some ranks makes every rank
+throw, as in a solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the
+solver above; `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves
+them directly.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
@@ -529,9 +623,9 @@ into PETSc's `shift * M - J` itself. A `DAEProblem`'s `jac(J, du, u, p, gamma, t
 ghosted and `du` owned, and writes PETSc's whole `dG/du + gamma dG/du'`. `jac` runs on every
 rank at every Jacobian, so anything collective in it has to be called on all of them in the
 same order, and it has to be in place: an out-of-place one is refused, as is a
-`jac_prototype`, since the DM gives the pattern, and a `jac` on an explicit method, which
-would never use it. `autodiff` is ignored with a `jac`. The heat equation above with its
-Jacobian, whose columns past the ends of the grid are dropped:
+`jac_prototype`, since the DM gives the pattern. An explicit method takes a `jac` and ignores
+it in its own solve, for `PETScAdjoint`. `autodiff` is ignored with a `jac`. The heat
+equation above with its Jacobian, whose columns past the ends of the grid are dropped:
 
 ```julia
 function heat_jac!(J, u, da, t)
@@ -544,29 +638,184 @@ fn = ODEFunction(heat!; jac = heat_jac!)
 sol_jac = solve(ODEProblem(fn, sinpi.((xs .+ (1:xm)) .* dx), (0.0, 0.1), da), TSImplicit("bdf"; dm = da))
 ```
 
+A DMStag, PETSc's staggered grid, keeps values on the vertices, edges, faces and cells of its
+elements, and runs through the same calls. On one, `PETScDiffEq.reshape_local_array(x, dm)`
+indexes `x[loc, c, i]` on a 1-D grid, `x[loc, c, i, j]` on a 2-D one and `x[loc, c, i, j, k]`
+on a 3-D one: component `c` at location `loc` of element `(i, j, k)`, where `loc` is a
+`LibPETSc.DMStagStencilLocation` such as `DMSTAG_ELEMENT`, `DMSTAG_LEFT` or `DMSTAG_DOWN`, and
+`c` and the elements count from 1, where PETSc counts from 0. A point on the upper side of an
+element, `DMSTAG_RIGHT` say, is the lower one of the next element. `axes(x, d)` gives the
+elements along axis `d` whose points `x` holds: the ghosted array takes in the ghost elements,
+and on the last rank along an axis that is not periodic the owned block runs to element
+`N + 1`, which holds only the points on that boundary, so `f` fills the cells up to `N` and the
+vertices up to `N + 1`. Any other point throws an `ArgumentError`. A `jac` writes through
+`set_stencil_values!` with points `(loc, c, i)`, `(loc, c, i, j)` or `(loc, c, i, j, k)`, which
+go to `DMStagMatSetValuesStencil`. Without one PETSc colours the DM's matrix as for a DMDA, so
+its stencil has to cover what `f` reads: a `DMSTAG_STENCIL_NONE` grid couples only the
+components at each point, `DMSTAG_STENCIL_STAR` reaches the neighbours along each axis within
+the stencil width and `DMSTAG_STENCIL_BOX`, PETSc.jl's default, the diagonal ones too. A wave
+with fluxes on the vertices, zero at both ends, and pressures in the cells:
+
+```julia
+stag = PETSc.DMStag(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), (1, 1), 1)
+LEFT, RIGHT, CELL = LibPETSc.DMSTAG_LEFT, LibPETSc.DMSTAG_RIGHT, LibPETSc.DMSTAG_ELEMENT
+
+function wave!(du, u, stag, t)
+    U = PETScDiffEq.reshape_local_array(u, stag)
+    D = PETScDiffEq.reshape_local_array(du, stag)
+    for i in axes(D, 1)
+        D[LEFT, 1, i] = i == 1 || i == N + 1 ? 0.0 : (U[CELL, 1, i - 1] - U[CELL, 1, i]) * N
+        i <= N && (D[CELL, 1, i] = (U[LEFT, 1, i] - U[RIGHT, 1, i]) * N)
+    end
+end
+
+function wave_jac!(J, u, stag, t)
+    for i in owned
+        1 < i <= N && set_stencil_values!(J, (LEFT, 1, i), ((CELL, 1, i - 1), (CELL, 1, i)), (N, -N))
+        i <= N && set_stencil_values!(J, (CELL, 1, i), ((LEFT, 1, i), (RIGHT, 1, i)), (N, -N))
+    end
+end
+
+u0 = zeros(LibPETSc.DMStagGetEntries(petsclib, stag))
+U0 = PETScDiffEq.reshape_local_array(u0, stag)
+owned = axes(U0, 1)
+for i in owned
+    i <= N && (U0[CELL, 1, i] = sinpi((i - 0.5) / N))
+end
+fn = ODEFunction(wave!; jac = wave_jac!)
+sol_stag = solve(ODEProblem(fn, u0, (0.0, 0.5), stag), TSImplicit("bdf"; dm = stag))
+```
+
+On `MPI.COMM_SELF` and on 1 to 3 ranks, a damped form of this wave and a 2-D one with fluxes on
+the faces matched the same equations written without a DM: bit for bit with `TSRK`, and to
+1.2e-14 with a `jac` and a direct linear solve, `["-ksp_type", "preonly", "-pc_type",
+"redundant"]`, in `TSImplicit` and `TSRosW`, which colouring moved by up to 1.4e-14. The wave
+also matched through the integrator to 1.1e-19 and with a mass matrix to 9.4e-15, on 1 to 3
+ranks as a `SplitODEProblem` in `TSARKIMEX` and a `DAEProblem` in `TSDAE` to 5.7e-15 and in its
+DAE initialization to 1.1e-19, and `PETScAdjoint` with a `jac` and a `paramjac` matched the
+serial adjoint to 2.3e-15 relative.
+
+A DMPlex, PETSc's unstructured mesh, runs through the same calls once it has a local section, a
+`PetscSection` that gives each mesh point its degrees of freedom: on the vertices, on the
+cells, or on any mix of the mesh's strata. The section has to be set up, point-major, without a
+permutation and without constrained degrees of freedom. `DMPlexCreateBoxMesh` leaves a mesh
+with an empty one, and a mesh without degrees of freedom, a section that is not set up and the
+other layouts are refused with an `ArgumentError`. `PETScDiffEq.reshape_local_array(x, dm)`
+indexes `x[c, p]`, component `c` of mesh point `p`, where `p` is PETSc's own point number,
+counted from 0 as `DMPlexGetDepthStratum`, `DMPlexGetHeightStratum`, `DMPlexGetCone` and
+`DMPlexGetSupport` give it, and `c` counts from 1. The ghosted `u` holds every point of this
+rank's part of the mesh, and `du` only the points the rank owns, which
+`checkbounds(Bool, D, c, p)` picks out. A point's neighbours are on its rank when the mesh is
+distributed with an overlap of one cell. The mesh does not change during a solve, so its
+connectivity is best gathered once, outside `f`. A `jac` writes through `set_stencil_values!`
+with points `(c, p)`, which go to `MatSetValues` at the indices of the DM's global section. The
+DM's matrix has the pattern of the DM's adjacency, which by default couples each point to the
+closure of its star: enough for vertices coupled along edges, while cells coupled across their
+faces need `DMSetBasicAdjacency(dm, true, false)`. PETSc refuses a `jac` entry outside the
+pattern, and without a `jac` it colours the pattern. Finite-element assembly through PetscFE
+and `DMPlexSNESComputeResidualFEM` is not used. Reaction-diffusion on the vertices of a
+triangulated box, which `PETSc.DMPlex` builds and distributes through `DMSetFromOptions`:
+
+```julia
+dm = PETSc.DMPlex(
+    petsclib, MPI.COMM_WORLD; dm_plex_dim = 2, dm_plex_simplex = true,
+    dm_plex_box_faces = "16,16", dm_distribute_overlap = 1,
+)
+vstart, vend = LibPETSc.DMPlexGetDepthStratum(petsclib, dm, 0)
+section = LibPETSc.PetscSectionCreate(petsclib, MPI.COMM_WORLD)
+LibPETSc.PetscSectionSetChart(petsclib, section, LibPETSc.DMPlexGetChart(petsclib, dm)...)
+for v in vstart:(vend - 1)
+    LibPETSc.PetscSectionSetDof(petsclib, section, v, 1)
+end
+LibPETSc.PetscSectionSetUp(petsclib, section)
+LibPETSc.DMSetLocalSection(petsclib, dm, section)
+LibPETSc.PetscSectionDestroy(petsclib, Ref(section))
+
+u0 = zeros(LibPETSc.VecGetLocalSize(petsclib, LibPETSc.DMCreateGlobalVector(petsclib, dm)))
+U0 = PETScDiffEq.reshape_local_array(u0, dm)
+owned = [v for v in vstart:(vend - 1) if checkbounds(Bool, U0, 1, v)]
+along_edges(v) = [
+    only(filter(!=(v), LibPETSc.DMPlexGetCone(petsclib, dm, e))) for
+        e in LibPETSc.DMPlexGetSupport(petsclib, dm, v)
+]
+neighbours = Dict(v => along_edges(v) for v in owned)
+for v in owned
+    U0[1, v] = sinpi(v / 10)
+end
+
+function rd!(du, u, dm, t)
+    U, D = PETScDiffEq.reshape_local_array(u, dm), PETScDiffEq.reshape_local_array(du, dm)
+    for v in owned
+        D[1, v] = 256 * sum(U[1, w] - U[1, v] for w in neighbours[v]) - U[1, v]^3
+    end
+end
+
+function rd_jac!(J, u, dm, t)
+    U = PETScDiffEq.reshape_local_array(u, dm)
+    for v in owned
+        ws = neighbours[v]
+        set_stencil_values!(
+            J, (1, v), [(1, v); [(1, w) for w in ws]],
+            [-256 * length(ws) - 3U[1, v]^2; fill(256.0, length(ws))],
+        )
+    end
+end
+
+fn = ODEFunction(rd!; jac = rd_jac!)
+sol_plex = solve(ODEProblem(fn, u0, (0.0, 0.1), dm), TSImplicit("bdf"; dm))
+```
+
+PETSc.jl 0.4's `PetscSectionCreate` fills a `Ref` it is given, `PetscSectionCreate(petsclib,
+MPI.COMM_WORLD, section)` with `section = Ref{LibPETSc.PetscSection}()`, instead of returning
+the section. On `MPI.COMM_SELF` and on 1 to 3 ranks, reaction-diffusion on the vertices of a
+triangulated box and in the cells of a box of squares, coupled across their edges, matched the
+same equations assembled without a DM from the same mesh: bit for bit with `TSRK`, to 1.2e-14
+with a `jac` and a direct linear solve in `TSImplicit` and `TSRosW`, which colouring moved by up
+to 9.8e-14, and exactly through the integrator. On `MPI.COMM_SELF` the vertex problem also
+matched with a mass matrix exactly, as a `SplitODEProblem` in `TSARKIMEX` to 5.4e-15 and as a
+`DAEProblem` in `TSDAE` to 1.1e-14, and `PETScAdjoint` with a `jac` and a `paramjac` matched the
+adjoint without a DM exactly.
+
 The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
 `TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
 ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
 and `du` owned. Everything else the package calls, such as a callback, `unstable_check` or
 `isoutofdomain`, sees the owned block. The TS works on a copy of the DM from `DMClone`, so the
-DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
-a serial solve. Only a DMDA is taken so far.
+DM itself stays free for further solves. A DM on `MPI.COMM_SELF`, or on a single rank, gives a
+serial solve. Only a DMDA, a DMStag or a DMPlex is taken so far, and any other DM, such as a
+DMShell, is refused with an `ArgumentError`.
 
-A solve with a `dm` refuses `TSIRK`, `TSMPRK`, an implicit `TSGeneric` and `PETScAdjoint`
-with an `ArgumentError`. A distributed solve, with a `dm` or without, is refused off the root task when Julia has more
-than one thread, whether inside `Threads.@threads` (as `EnsembleThreads` runs its
-trajectories) or from a `Threads.@spawn` task: nothing there keeps the ranks' solves in the
-same order, and ranks taking them in different orders run different solves as one and can
-return wrong results without an error. An ensemble of distributed solves runs with
+`PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
+and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
+well. It needs the problem's `jac`, filling the DM's matrix as above, and when there are
+parameters a `paramjac(pJ, u, p, t)` that gets `u` ghosted and fills this rank's rows of `pJ`
+in the DM's order, a column per entry of `p`, which
+`PETScDiffEq.reshape_local_array(view(pJ, :, k), dm)` indexes by grid point; a
+`SplitODEProblem` needs `f2`'s as well. Neither is built when missing: automatic
+differentiation would not see the ghosted array, and colouring only approximates the
+Jacobian, which moved the gradient by up to 3.5e-9 in a reaction-diffusion test and which
+PETSc's `TSARKIMEX` adjoint cannot use at all. The rest follows the distributed adjoint above:
+the cost functions get this rank's block of the state as `solve` saves it, not the ghosted
+array, `du0` comes back as that block and `dp` whole on every rank, and a function that
+throws on some ranks makes every rank throw. On 1-D and 2-D DMDAs of 1 to 3 ranks the
+gradient agreed with the comm-mode and serial adjoints of the same discretization to 2e-15
+and with central differences of the same fixed-step solve to 1.4e-9.
+
+A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` with an
+`ArgumentError`. A distributed solve, with a `dm` or without, is refused off the root task
+when Julia has more than one thread, whether inside `Threads.@threads` (as `EnsembleThreads`
+runs its trajectories) or from a `Threads.@spawn` task: nothing there keeps the ranks' solves
+in the same order, and ranks taking them in different orders run different solves as one and
+can return wrong results without an error. An ensemble of distributed solves runs with
 `EnsembleSerial()`.
 
 ## Limitations
 
-A `DynamicalODEProblem` or `SecondOrderODEProblem` does not run distributed yet, whatever the
-algorithm, so `TSBasicSymplectic` and `TSAlpha2` run on `MPI.COMM_SELF` only. PETSc TS is
-built for large distributed problems, and reaching it from the SciML interface is what this
-package is for; use OrdinaryDiffEq.jl for serial problems where it applies.
+A `DynamicalODEProblem` or `SecondOrderODEProblem` runs distributed over a `comm` but not
+with a `dm`, and `PETScAdjoint` takes one on `MPI.COMM_SELF` only. PETSc TS is built for large
+distributed problems, and reaching it from the SciML interface is what this package is for;
+use OrdinaryDiffEq.jl for serial problems where it applies.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
