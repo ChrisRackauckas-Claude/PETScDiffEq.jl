@@ -160,8 +160,8 @@ Jacobian from the prototype instead, for `TSAlpha2` and for the implicit algorit
 first-order form, as it does for an `ODEProblem`: the columns are coloured in the prototype's
 order, and each rank seeds the entries of its own `[v; u]` that those columns stand for, so
 `f1` and `f2` have to exchange dual numbers as `f` does there. It needs the sparse prototype,
-and other backends are refused. A `dm` is refused for these problems, and so is `PETScAdjoint`
-on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
+and other backends are refused. A `dm` is refused for these problems. Split over 1 to 3 ranks,
+unevenly on more than one, a 1-D wave equation and a
 chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
 steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
 `TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
@@ -204,6 +204,17 @@ the gradient of the serial split adjoint to 7e-16 and that of central difference
 same fixed-step solve to 1.2e-9. With `f2`'s `jac` and `paramjac` built the gradient was the
 same to the last digit, and with `f1`'s built it was within 8.2e-15, which is where building
 them puts it on `MPI.COMM_SELF` too.
+
+A `DynamicalODEProblem` or `SecondOrderODEProblem` is differentiated there too, with the same
+methods on its first-order form. Its `jac` fills the prototype described above, this rank's
+`v` rows and then its `u` rows with the columns of the whole `[v; u]`, and `paramjac` fills
+the same rows. A missing one is built with ForwardDiff as for an `ODEProblem`, the `jac` from
+that prototype with each rank seeding its own `[v; u]`. The cost functions get this rank's
+`ArrayPartition(v, u)` and write their derivative into one, and `du0` comes back as one. On 2
+ranks a damped nonlinear wave gave the serial adjoint's gradient to 3.1e-14 with each of the
+six methods, and on one rank that of central differences of the same fixed-step solve to
+2e-10. With `jac` and `paramjac` built the gradient stayed within 3.1e-15 of the one from
+hand-written ones on the same ranks.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's

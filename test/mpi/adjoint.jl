@@ -26,6 +26,9 @@ const SPLIT_GAP = 5.0e-15
 const AD_GAP = 1.0e-14
 # Measured at 1 and 2 ranks: a split problem building `f1`'s `jac` is within 8.2e-15 of serial.
 const SPLIT_AD_GAP = 5.0e-14
+# Measured at 2 ranks: a partitioned problem is within 3.1e-14 of its serial adjoint, and
+# within 3.3e-14 with `jac` and `paramjac` built.
+const WAVE_GAP = 2.0e-13
 const FD_GAP = 2.0e-9
 const thrower = nranks - 1
 
@@ -216,6 +219,102 @@ const METHODS = (
     ("ARKIMEX l2", (c; kw...) -> TSARKIMEX("l2", exact(c); comm = c, kw...)),
     ("ARKIMEX 3", (c; kw...) -> TSARKIMEX("3", exact(c); comm = c, kw...)),
 )
+
+# A damped nonlinear wave as a DynamicalODEProblem, each rank holding its v and its u.
+const Q = [0.8, 1.5, 0.5, 0.3]
+wave0(idx) = (0.3 .* sinpi.(2 .* x.(idx)), heat0(idx))
+
+kick(idx, ghosts) = function (dv, v, u, p, t)
+    l, r = ghosts(u)
+    for (k, i) in enumerate(idx)
+        dv[k] = p[1] * laplacian(u, k, l, r) + p[2] * source(i) - p[3] * u[k]^3 - p[4] * v[k]
+    end
+    return nothing
+end
+drift(du, v, u, p, t) = (du .= v; nothing)
+
+# This rank's v rows and then its u rows, with the columns of the whole [v; u].
+function wave_proto(idx)
+    n = length(idx)
+    I = vcat(1:n, [k for (k, i) in enumerate(idx) for _ in neighbours(i)], n .+ (1:n))
+    J = vcat(idx, [N + j for i in idx for j in neighbours(i)], idx)
+    return sparse(I, J, ones(length(I)), 2n, 2N)
+end
+
+wave_jac(idx) = function (J, z, p, t)
+    n, u = length(idx), z.x[2]
+    for (k, i) in enumerate(idx)
+        J[k, i] = -p[4]
+        for j in neighbours(i)
+            J[k, N + j] = p[1] * (i == j ? -2 : 1) / dx^2 - (i == j) * 3 * p[3] * u[k]^2
+        end
+        J[n + k, i] = 1.0
+    end
+    return nothing
+end
+
+wave_paramjac(idx, ghosts) = function (pJ, z, p, t)
+    v, u = z.x
+    l, r = ghosts(u)
+    fill!(pJ, 0.0)
+    for (k, i) in enumerate(idx)
+        pJ[k, 1] = laplacian(u, k, l, r)
+        pJ[k, 2] = source(i)
+        pJ[k, 3] = -u[k]^3
+        pJ[k, 4] = -v[k]
+    end
+    return nothing
+end
+
+function wave_problem(
+        idx, ghosts; tspan = first(FORWARD), state = wave0(idx), p = copy(Q),
+        f1 = kick(idx, ghosts), f2 = drift, jac = wave_jac(idx),
+        paramjac = wave_paramjac(idx, ghosts), jac_prototype = wave_proto(idx),
+    )
+    fn = SciMLBase.DynamicalODEFunction{true}(f1, f2; jac, paramjac, jac_prototype)
+    return SciMLBase.DynamicalODEProblem(fn, state..., tspan, p)
+end
+
+wave_cost(z, p, idx) = sum(abs2, z.x[1]) + sum(abs2, z.x[2]) / 2 + p[2] * sum(z.x[2] .* x.(idx))
+wave_cost_du(idx) = function (out, z, p, t, i)
+    out.x[1] .= 2 .* z.x[1]
+    out.x[2] .= z.x[2] .+ p[2] .* x.(idx)
+    return nothing
+end
+wave_cost_dp(idx) =
+    (out, z, p, t, i) -> (fill!(out, 0.0); out[2] = sum(z.x[2] .* x.(idx)); nothing)
+
+wave_gradient(prob, alg, times, idx; kw...) = PETScDiffEq._discrete_adjoint(
+    prob, alg, PETScAdjoint(); t = times, dgdu_discrete = wave_cost_du(idx),
+    dgdp_discrete = wave_cost_dp(idx), dt = DT, adaptive = false, kw...,
+)
+
+# The serial [v; u] and then p.
+joined(du0, dp) = vcat(gathered(du0.x[1], counts), gathered(du0.x[2], counts), vec(dp))
+
+# Measured: roundoff puts these differences 2.7e-9 off at h = 1e-6 and 2.0e-10 off at 1e-5.
+function wave_differenced(alg, tspan, times; h = 1.0e-5)
+    g = zeros(2N + length(Q))
+    for j in eachindex(g)
+        function at(s)
+            (v0, u0), p = wave0(rows), copy(Q)
+            i = (j - 1) % N + 1
+            if j > 2N
+                p[j - 2N] += s
+            elseif i in rows
+                (j > N ? u0 : v0)[i - first(rows) + 1] += s
+            end
+            # DiffEqBase's solve cannot rebuild a DynamicalODEFunction that carries a jac_prototype.
+            sol = SciMLBase.__solve(
+                wave_problem(rows, halo; tspan, state = (v0, u0), p), alg; dt = DT,
+                adaptive = false, saveat = times,
+            )
+            return MPI.Allreduce(sum(wave_cost(z, p, rows) for z in sol.u), +, comm)
+        end
+        g[j] = (at(h) - at(-h)) / 2h
+    end
+    return g
+end
 
 const GHOSTED = LibPETSc.DM_BOUNDARY_GHOSTED
 const da = PETSc.DMDA(pl, comm, (GHOSTED,), (N,), 1, 1; points_per_proc = (LibPETSc.PetscInt.(counts),))
@@ -460,6 +559,65 @@ end
         rank == 0 && @test relerr(mine, ref) <= SERIAL_GAP
     end
 
+    @testset "a partitioned problem matches the serial adjoint and finite differences: $name, $dir" for (
+                name, make,
+            ) in METHODS, (dir, (tspan, times)) in (("forward", FORWARD[1:2]), ("backward", BACKWARD[1:2]))
+        alg = make(comm)
+        prob = wave_problem(rows, halo; tspan)
+        du0, dp = wave_gradient(prob, alg, times, rows)
+        @test du0 isa typeof(prob.u0)
+        @test same_everywhere(dp)
+        mine = joined(du0, dp)
+        fd = wave_differenced(alg, tspan, times)
+        if rank == 0
+            serial = wave_gradient(wave_problem(1:N, walls; tspan), make(MPI.COMM_SELF), times, 1:N)
+            reference = vcat(collect(serial[1]), vec(serial[2]))
+            @test relerr(mine, reference) <= WAVE_GAP
+            @test relerr(mine, fd) <= FD_GAP
+        end
+        dual = make(comm; autodiff = AutoForwardDiff())
+        for built in ((:jac, :paramjac), (:jac,), (:paramjac,))
+            bare = wave_problem(rows, halo; tspan, (key => nothing for key in built)...)
+            du0, dp = wave_gradient(bare, dual, times, rows)
+            @test same_everywhere(dp)
+            auto = joined(du0, dp)
+            if rank == 0
+                @test relerr(auto, reference) <= WAVE_GAP
+                @test relerr(auto, fd) <= FD_GAP
+            end
+        end
+    end
+
+    @testset "a partitioned problem's $what throwing raises on every rank" for what in (
+            "jac", "paramjac", "dgdu",
+        )
+        pick(key, f) = key == what ? throwing(f, what, (args...) -> true) : f
+        prob = wave_problem(
+            rows, halo; jac = pick("jac", wave_jac(rows)),
+            paramjac = pick("paramjac", wave_paramjac(rows, halo)),
+        )
+        e = caught() do
+            wave_gradient(
+                prob, TSRK("4"; comm), FORWARD[2], rows;
+                dgdu_discrete = pick("dgdu", wave_cost_du(rows)),
+            )
+        end
+        @test raised(e, "$what threw")
+    end
+
+    @testset "a kick throwing on one rank while the Jacobians are built raises on every rank" begin
+        started = Ref(false)
+        dz = wave_cost_du(rows)
+        # The drift communicates too, so a rank that skipped it would leave the others waiting.
+        prob = wave_problem(
+            rows, halo; f1 = throwing(kick(rows, halo), "kick", (args...) -> started[]),
+            f2 = (du, v, u, p, t) -> (halo(v); du .= v; nothing), jac = nothing, paramjac = nothing,
+        )
+        dgdu = (args...) -> (started[] = true; dz(args...))
+        e = caught(() -> wave_gradient(prob, TSRK("4"; comm), FORWARD[2], rows; dgdu_discrete = dgdu))
+        @test raised(e, "kick threw")
+    end
+
     @testset "a function throwing on one rank raises on every rank: $what, $name" for (
             what, name, alg, pieces,
         ) in (
@@ -668,6 +826,18 @@ end
         nranks > 1 && @test refused(
             () -> gradient(dm_problem(), rk_dm, times, rows; g = (u, p, t) -> sum(abs2, u)),
             "integral cost on MPI.COMM_SELF only",
+        )
+        for (alg, kw, what) in (
+                (colouring, (; jac = nothing), "`jac` under `autodiff = AutoFiniteDiff()`"),
+                (colouring, (; paramjac = nothing), "`paramjac` under `autodiff = AutoFiniteDiff()`"),
+                (rk, (; jac_prototype = nothing), "sparse `jac_prototype`"),
+                (rk, (; jac = nothing, jac_prototype = nothing), "without a `jac`, PETScAdjoint"),
+            )
+            @test refused(() -> wave_gradient(wave_problem(rows, halo; kw...), alg, times, rows), what)
+        end
+        @test refused(
+            () -> wave_gradient(wave_problem(rows, halo), TSBasicSymplectic(; comm), times, rows),
+            "PETSc has no adjoint for TSBasicSymplectic",
         )
         grows = ODEProblem(
             ODEFunction(grow!; jac = grow_jac!, jac_prototype = diagonal), ones(length(rows)),

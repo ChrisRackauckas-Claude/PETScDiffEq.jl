@@ -47,8 +47,7 @@ system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, w
 are that system's, taking the state as an `ArrayPartition(v, u)` as the forward solve's
 `jac` does, and are otherwise built from `f1` and `f2`. The cost functions are handed the
 state as an `ArrayPartition` and write its derivative into one, and `du0` comes back as
-one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused, and so
-is a `comm` other than `MPI.COMM_SELF` for these problems.
+one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused.
 
 The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
@@ -113,7 +112,11 @@ without a `jac`. `dgdu_discrete` gets this rank's rows of the state and writes t
 derivative, and `dgdp_discrete` gives this rank's share of the direct derivative, which the
 ranks add up. `du0` holds this rank's rows, and `dp` is the whole gradient on every rank.
 The cost times, `no_start`, the length of `p` and whether `dgdp_discrete`, `jac` and
-`paramjac` are given must agree across the ranks.
+`paramjac` are given must agree across the ranks. A `DynamicalODEProblem` or
+`SecondOrderODEProblem` runs there too: its `jac_prototype` holds this rank's `v` rows and
+then its `u` rows, with the columns of the whole `[v; u]` as in its solve, `paramjac` fills
+the same rows, a missing `jac` or `paramjac` is built as above, and the costs and `du0` are
+this rank's `ArrayPartition(v, u)`.
 
 With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and discrete
 costs, and on a DM of a single rank for integral costs and a `SplitODEProblem` with
@@ -687,12 +690,6 @@ function _check_adjoint_problem(
                 "or solve the summed problem as an ODEProblem",
         ),
     )
-    prob.f isa SciMLBase.DynamicalODEFunction && comm !== nothing && throw(
-        ArgumentError(
-            "PETScAdjoint supports a DynamicalODEProblem or SecondOrderODEProblem on " *
-                "MPI.COMM_SELF only",
-        ),
-    )
     eltype(prob.u0) <: Real || throw(
         ArgumentError(
             "PETScAdjoint supports a real state only; it runs in PETSc's double real " *
@@ -1159,6 +1156,9 @@ function _discrete_adjoint_unlocked(
         user_jac(j) = dyn ? _partitioned_jac(j, prob.u0, iip) : _as_inplace_jac(j, iip)
         user_t0 = Float64(prob.tspan[1])
         rhs, f_rhs = is_split ? (prob.f.f2, inplace(prob.f.f2)) : (prob.f, f_ad)
+        # A partitioned prototype's columns number the whole [v; u], every velocity first.
+        colmap = dyn && comm !== nothing && !implicit ?
+            _flat_columns(length(prob.u0.x[1]), n, comm) : nothing
         jac, J = nothing, zeros(0, 0)
         if dm !== nothing
             (!implicit || is_split) && (jac = Ghosted(rhs.jac, pl, dm.ptr))
@@ -1175,7 +1175,7 @@ function _discrete_adjoint_unlocked(
                 _checked_everywhere(() -> _check_local_rows(rhs.jac_prototype, n, N), comm)
                 _ad_comm_jacobian(
                     backend, f_rhs, rhs.jac_prototype, h.u0, p, user_t0, Ref(0),
-                    _ADJOINT_JAC_ADVICE, comm, false,
+                    _ADJOINT_JAC_ADVICE, comm, false, colmap,
                 )
             end
             h.tdir < 0 && (jac = _reverse_jac(jac))
@@ -1187,7 +1187,7 @@ function _discrete_adjoint_unlocked(
         coo_rows, coo_cols, coo = if comm === nothing || (implicit && !is_split) || dm !== nothing
             nothing, nothing, nothing
         else
-            _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing)
+            _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing, colmap)
         end
         paramjac(fun, f) = np == 0 ? nothing :
             dm !== nothing ? Ghosted(fun.paramjac, pl, dm.ptr) :
