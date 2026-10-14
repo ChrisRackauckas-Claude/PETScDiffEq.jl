@@ -333,7 +333,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             # Uncapped, u grows until PETSc's FD Jacobian is zero: a zero pivot.
             pivots = PETScDiffEq.TSARKIMEX(
-                "3", [bounded.petsc_options; "-snes_linesearch_maxlambda"; "1e300"];
+                "3", [bounded.petsc_options; "-snes_linesearch_maxstep"; "1e300"];
                 autodiff = PETScDiffEq.AutoFiniteDiff(),
             )
             prob = halves(-1.0, -2000.0)
