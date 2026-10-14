@@ -4036,6 +4036,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (() -> SciMLBase.CallbackSet(bump(), halve), (;)),
                 (() -> root, (;)), (() -> quiet, (;)), (() -> roots, (;)), (() -> stop, (;)),
                 (() -> ending, (;)), (() -> ending, (; save_everystep = false)),
+                (() -> ending, (; save_discretes = false, save_everystep = false)),
             )
             ours = SciMLBase.solve(prob(), rk4; callback = callback(), fixed..., kw...)
             theirs = SciMLBase.solve(prob(), Tsit5(); callback = callback(), fixed..., kw...)
