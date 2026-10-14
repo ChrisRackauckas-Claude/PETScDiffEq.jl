@@ -6497,7 +6497,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     integ.derivative_discontinuity = false
     _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
     integ.finished && return nothing
-    initialize_save && _discretes(integ.sol) !== nothing &&
+    initialize_save && integ.opts.save_discretes && _discretes(integ.sol) !== nothing &&
         SciMLBase.save_discretes_if_enabled!(integ, integ.opts.callback; skip_duplicates = true)
     _everywhere(h.ctx.comm, integ.u == before) && return nothing
     copyto!(integ.uprev, integ.u)
@@ -6841,7 +6841,8 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
     sol = _with_discretes(sol, _discretes(integ.sol))
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
     # As in OrdinaryDiffEq, a finalizer's discretes are saved with an end point added here.
-    unsaved && _last_recorded(h.ctx, s) && _discretes(sol) !== nothing &&
+    unsaved && integ.opts.save_discretes && _last_recorded(h.ctx, s) &&
+        _discretes(sol) !== nothing &&
         SciMLBase.save_final_discretes!(integ, integ.opts.callback)
     integ.finished = true
     _destroy!(h)
