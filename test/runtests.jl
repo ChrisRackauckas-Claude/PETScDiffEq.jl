@@ -4036,10 +4036,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (() -> SciMLBase.CallbackSet(bump(), halve), (;)),
                 (() -> root, (;)), (() -> quiet, (;)), (() -> roots, (;)), (() -> stop, (;)),
                 (() -> ending, (;)), (() -> ending, (; save_everystep = false)),
+                (() -> ending, (; save_discretes = false, save_everystep = false)),
             )
             ours = SciMLBase.solve(prob(), rk4; callback = callback(), fixed..., kw...)
             theirs = SciMLBase.solve(prob(), Tsit5(); callback = callback(), fixed..., kw...)
             @test same(ours, theirs)
+            if get(kw, :save_discretes, true) === false
+                @test all(d -> isempty(d.t), ours.discretes)
+            end
         end
         back = SciMLBase.ODEProblem(f, [1.0], (1.0, 0.0), [0.0, 10.0, 1.0])
         @test SciMLBase.solve(back, rk4; callback = bump(), fixed...).discretes[1].t ≈ 1:-0.1:0
