@@ -4918,6 +4918,18 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 SciMLBase.solve(ode(grid!, u0), rk; kw...),
                 SciMLBase.solve(ode(flat(grid!), vec(u0)), rk; kw...),
             )
+            picked = [CartesianIndex(2, 2), CartesianIndex(3, 1)]
+            for saving in ((;), (; saveat = 0.25))
+                whole = SciMLBase.solve(ode(grid!, u0), rk; saving...)
+                by_axes = SciMLBase.solve(ode(grid!, u0), rk; saving..., save_idxs = picked)
+                @test by_axes.t == whole.t
+                @test by_axes.u == [u[picked] for u in whole.u]
+                one = SciMLBase.solve(ode(grid!, u0), rk; saving..., save_idxs = picked[1])
+                @test one.u == [[u[picked[1]]] for u in whole.u]
+            end
+            @test_throws "`save_idxs` has the index (4, 1), outside a state of size (3, 2)" SciMLBase.solve(
+                ode(grid!, u0), rk; save_idxs = [CartesianIndex(4, 1)],
+            )
             tol = [1.0e-6 * k for k in 1:6]
             by_vector = SciMLBase.solve(ode(grid!, u0), rk; abstol = tol)
             @test same(by_vector, SciMLBase.solve(ode(flat(grid!), vec(u0)), rk; abstol = tol))
@@ -4983,6 +4995,16 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 ode(grid!, u0), rk, PETScAdjoint(); t = [1.0],
                 dgdu_discrete = (out, u, p, t, i) -> (out .= 1; nothing),
             )
+            integ = SciMLBase.init(ode(grid!, u0), rk)
+            for wrong in (ones(5), ones(2, 2))
+                @test_throws DimensionMismatch SciMLBase.reinit!(integ, wrong)
+                @test_throws "but the problem's `u0` has size (3, 2); give one with its 6 entries" SciMLBase.reinit!(
+                    integ, wrong,
+                )
+            end
+            SciMLBase.reinit!(integ, vec(2 .* u0))
+            @test integ.u == 2 .* u0
+            SciMLBase.terminate!(integ)
         end
     end
 
@@ -10943,10 +10965,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         bare(; jac_prototype = sparse(ones(2, 3))), TSRK("4"; comm = world),
                         "so it must be 2 x 2",
                     ),
-                    (bare(), TSImplicit("cn"; comm = world), "`jac` under `autodiff = AutoFiniteDiff()`"),
+                    (
+                        bare(), TSImplicit("cn"; comm = world),
+                        [
+                            "`jac` under `autodiff = AutoFiniteDiff()`",
+                            "give the problem a `jac`, or pass `autodiff = AutoForwardDiff()`",
+                            "is its default on a communicator other than MPI.COMM_SELF",
+                        ],
+                    ),
                     (
                         bare(; jac = adj_jac!), TSImplicit("cn"; comm = world),
-                        "`paramjac` under `autodiff = AutoFiniteDiff()`",
+                        [
+                            "`paramjac` under `autodiff = AutoFiniteDiff()`",
+                            "give the problem a `paramjac`, or pass `autodiff = AutoForwardDiff()`",
+                            "is its default on a communicator other than MPI.COMM_SELF",
+                        ],
                     ),
                     (
                         bare(), TSImplicit("cn"; comm = world, autodiff = zygote),
