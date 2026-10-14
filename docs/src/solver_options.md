@@ -133,10 +133,10 @@ it sets `initialize_save_discretes = false` or `init` is given `initialize_save 
 and after each `affect!`, a `VectorContinuousCallback` saving the partitions of the events
 that fired and a `ContinuousCallback` none after an `affect!` that clears the derivative
 discontinuity. One with a `finalize` has them saved at the end when the end point is added
-there, as under `save_everystep = false`. `save_discretes = false` leaves out the saves
-after an `affect!` and keeps the others, and an integrator's `opts.save_discretes` can
-change between steps. `save_on = false` does not affect them. `reinit!` starts the history
-again, where OrdinaryDiffEq's keeps the earlier values, and goes on from it with
-`erase_sol = false`. On a communicator or with a `dm` each rank saves from its own
+there, as under `save_everystep = false`. `save_discretes = false` disables the initial
+save, saves after an `affect!`, and the finalizer's end-point save. An integrator's
+`opts.save_discretes` can change between steps. `save_on = false` does not affect them.
+`reinit!` starts the history again, where OrdinaryDiffEq keeps earlier values, and
+continues it with `erase_sol = false`. On a communicator or with a `dm` each rank saves from its own
 parameters. A `DAEProblem`'s solution has no storage for them in SciMLBase, so none are
 saved there.

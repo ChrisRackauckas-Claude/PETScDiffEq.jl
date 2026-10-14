@@ -4041,6 +4041,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             ours = SciMLBase.solve(prob(), rk4; callback = callback(), fixed..., kw...)
             theirs = SciMLBase.solve(prob(), Tsit5(); callback = callback(), fixed..., kw...)
             @test same(ours, theirs)
+            if get(kw, :save_discretes, true) === false
+                @test all(d -> isempty(d.t), ours.discretes)
+            end
         end
         back = SciMLBase.ODEProblem(f, [1.0], (1.0, 0.0), [0.0, 10.0, 1.0])
         @test SciMLBase.solve(back, rk4; callback = bump(), fixed...).discretes[1].t ≈ 1:-0.1:0
