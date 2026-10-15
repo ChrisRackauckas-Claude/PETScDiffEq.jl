@@ -5799,8 +5799,17 @@ function _retry_solve!(h, alg, floor, forced, verbose)
     return true
 end
 
-SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
-    _locked(() -> _solve_unlocked(prob, alg; kwargs...))
+_refuse_discrete(prob) = prob isa SciMLBase.AbstractDiscreteProblem && throw(
+    ArgumentError(
+        "PETScDiffEq does not support $(nameof(typeof(prob))); PETSc's TS integrates " *
+            "differential equations, not maps",
+    ),
+)
+
+function SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...)
+    _refuse_discrete(prob)
+    return _locked(() -> _solve_unlocked(prob, alg; kwargs...))
+end
 
 SciMLBase.__solve(
     prob::SupportedProblem, alg::AnyPETScTS, ::AbstractVector, ::AbstractVector, ks = nothing;
@@ -6681,8 +6690,10 @@ function _init_unlocked(
     return integ
 end
 
-SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
-    _locked(() -> _init_unlocked(prob, alg; kwargs...))
+function SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...)
+    _refuse_discrete(prob)
+    return _locked(() -> _init_unlocked(prob, alg; kwargs...))
+end
 
 function _restore_prev!(integ::PETScIntegrator, outer)
     outer === nothing && return nothing
