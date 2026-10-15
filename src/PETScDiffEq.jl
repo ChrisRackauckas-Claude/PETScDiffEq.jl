@@ -16,6 +16,7 @@ using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
 using SparseMatrixColorings: SparseMatrixColorings
+using SymbolicIndexingInterface: SymbolicIndexingInterface as SII
 
 include("petsc_compat.jl")
 
@@ -2823,7 +2824,8 @@ function _flat_tol(tol, dims::Dims, name)
     return vec(tol)
 end
 
-# `save_idxs` as linear indices into the state, which a CartesianIndex names by its axes.
+# `save_idxs` as linear indices into the state: a CartesianIndex by its axes, a symbol through
+# the problem's system.
 _save_index(u0, i) = Int(i)
 function _save_index(u0, I::CartesianIndex)
     checkbounds(Bool, u0, I) || throw(
@@ -2833,8 +2835,32 @@ function _save_index(u0, I::CartesianIndex)
     )
     return LinearIndices(u0)[I]
 end
-_save_idxs(u0, idxs::Union{Integer, CartesianIndex}) = [_save_index(u0, idxs)]
-_save_idxs(u0, idxs) = Int[_save_index(u0, i) for i in idxs]
+
+function _save_idxs(prob, idxs)
+    idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic() ||
+        return _state_indices!(Int[], prob, idxs)
+    v = Int[]
+    for i in idxs
+        _state_indices!(v, prob, i)
+    end
+    return v
+end
+
+_state_indices!(v, prob, i::Union{Integer, CartesianIndex}) = push!(v, _save_index(prob.u0, i))
+function _state_indices!(v, prob, sym)
+    i = SII.variable_index(prob, sym)
+    i === nothing && throw(
+        ArgumentError(
+            "`save_idxs` names $sym, which is not a state of the problem's system; " *
+                "only states can be saved",
+        ),
+    )
+    return append!(v, i)
+end
+
+# The integer `save_idxs` method keeps the order the states are saved in.
+_saved_subsystem(prob, ctx) =
+    last(SciMLBase.get_save_idxs_and_saved_subsystem(prob, ctx.save_idxs))
 
 function _buffer!(box, like)
     buf = box[]
@@ -5061,7 +5087,7 @@ function _setup(
         nothing
     else
         _checked_everywhere(comm) do
-            v = _save_idxs(prob.u0, save_idxs)
+            v = _save_idxs(prob, save_idxs)
             isempty(v) && throw(ArgumentError("`save_idxs` must name at least one component"))
             all(i -> 1 <= i <= n, v) || throw(
                 ArgumentError("`save_idxs` has an index outside 1:$n"),
@@ -5526,6 +5552,7 @@ function _assemble(
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        saved_subsystem = _saved_subsystem(prob, ctx),
         calculate_error = get(kwargs, :calculate_error, true),
         timeseries_errors = get(kwargs, :timeseries_errors, true),
         dense_errors = get(kwargs, :dense_errors, false),
@@ -6037,6 +6064,7 @@ function _adopt_p!(integ::PETScIntegrator, p)
     rebuilt = SciMLBase.build_solution(
         integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
         dense = sol.dense, interp = sol.interp,
+        saved_subsystem = _saved_subsystem(integ.prob, integ.h.ctx),
         calculate_error = get(integ.kwargs, :calculate_error, true),
         timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
         dense_errors = get(integ.kwargs, :dense_errors, false),
@@ -6733,6 +6761,7 @@ function _initial_solution(prob, alg, h::TSHandles, kwargs)
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
         dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = stats,
+        saved_subsystem = _saved_subsystem(prob, h.ctx),
         calculate_error = get(kwargs, :calculate_error, true),
     )
 end
