@@ -2,14 +2,14 @@
 
 The options available in `solve` are documented
 [at the common solver options page](https://docs.sciml.ai/DiffEqDocs/stable/basics/common_solver_opts/).
-This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
-`abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
+This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `maxiters`, `reltol`
+and `abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
 `save_start`, `save_end`, `save_on`, `save_idxs`, `save_discretes`, `dense`, `callback`,
-`tstops`, `d_discontinuities`, `unstable_check`, `isoutofdomain`, `timeseries_errors`,
-`dense_errors`, `verbose` and `initializealg`. The warning a solve that ends early gives is logged at the
-`instability` level of a `DEVerbosity`, so `verbose = DEVerbosity(SciMLLogging.None())`
-silences it, as do `SciMLLogging.None()` and `false`. Keywords it cannot honour emit a
-warning rather than being silently dropped.
+`tstops`, `d_discontinuities`, `unstable_check`, `isoutofdomain`, `calculate_error`,
+`timeseries_errors`, `dense_errors`, `verbose` and `initializealg`. The warning a solve that
+ends early gives is logged at the `instability` level of a `DEVerbosity`, so
+`verbose = DEVerbosity(SciMLLogging.None())` silences it, as do `SciMLLogging.None()` and
+`false`. Keywords it cannot honour emit a warning rather than being silently dropped.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
@@ -17,7 +17,9 @@ saves every step alongside it. `dtmin` is a floor the solve keeps: once PETSc pr
 smaller step, the solve ends there with `ReturnCode.DtLessThanMin`. A step shortened to
 land on a stop or the final time does not count, and a fixed-step solve has no floor, as in
 OrdinaryDiffEq. With `force_dtmin = true` the solve goes on at `dtmin` instead, and the floor
-wins over a smaller `dtmax`. `d_discontinuities` are stepped onto, and, as SciML defines them,
+wins over a smaller `dtmax`. A NaN `dt`, `dtmin` or `dtmax`, an infinite `dt` and a zero
+`dtmax` throw an `ArgumentError`, where OrdinaryDiffEq ends the solve with `DtNaN` or
+`Unstable`, or takes an infinite `dt` as the whole span. `d_discontinuities` are stepped onto, and, as SciML defines them,
 the step after each starts one ULP past it, so the right-hand side there sees the new regime
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
@@ -72,9 +74,10 @@ where the package interpolates itself, and it raises with a mass matrix or a `DA
 OrdinaryDiffEq's integrator does.
 
 `ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
-`SecondOrderODEProblem` are supported, in place or out of place, along with
-`ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
-anything sparse: without one the Jacobian is dense and forces a dense factorization.
+`SecondOrderODEProblem` are supported, in place or out of place except for a `DAEProblem`,
+whose residual has to be in place, along with `ODEFunction`'s `jac`, `jac_prototype` and
+`mass_matrix`. Supply a `jac_prototype` for anything sparse: without one the Jacobian is
+dense and forces a dense factorization.
 
 `TSARKIMEX` integrates the `f1` of a `SplitODEProblem` implicitly and its `f2` explicitly.
 Every other algorithm solves it as the `ODEProblem` of `f1 + f2` and returns that problem's
@@ -133,10 +136,10 @@ it sets `initialize_save_discretes = false` or `init` is given `initialize_save 
 and after each `affect!`, a `VectorContinuousCallback` saving the partitions of the events
 that fired and a `ContinuousCallback` none after an `affect!` that clears the derivative
 discontinuity. One with a `finalize` has them saved at the end when the end point is added
-there, as under `save_everystep = false`. `save_discretes = false` leaves out the saves
-after an `affect!` and keeps the others, and an integrator's `opts.save_discretes` can
-change between steps. `save_on = false` does not affect them. `reinit!` starts the history
-again, where OrdinaryDiffEq's keeps the earlier values, and goes on from it with
-`erase_sol = false`. On a communicator or with a `dm` each rank saves from its own
+there, as under `save_everystep = false`. `save_discretes = false` disables the initial
+save, saves after an `affect!`, and the finalizer's end-point save. An integrator's
+`opts.save_discretes` can change between steps. `save_on = false` does not affect them.
+`reinit!` starts the history again, where OrdinaryDiffEq keeps earlier values, and
+continues it with `erase_sol = false`. On a communicator or with a `dm` each rank saves from its own
 parameters. A `DAEProblem`'s solution has no storage for them in SciMLBase, so none are
 saved there.
