@@ -1529,7 +1529,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             integ = SciMLBase.init(decay, alg; dt = 0.1, adaptive = false)
             SciMLBase.step!(integ)
             integ.u[1] = 5.0
-            mark && SciMLBase.u_modified!(integ, true)
+            mark && SciMLBase.derivative_discontinuity!(integ, true)
             SciMLBase.step!(integ)
             @test integ.u[1] ≈ 5exp(-0.1) rtol = 1.0e-6
         end
@@ -8398,7 +8398,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             scaled!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
             integ = halfway(SciMLBase.ODEProblem(scaled!, [1.0], (0.0, 1.0), [1.0]))
             integ.p[1] = 3.0
-            SciMLBase.u_modified!(integ, true)
+            SciMLBase.derivative_discontinuity!(integ, true)
             SciMLBase.step!(integ)
             @test integ(0.55) == expected(integ, 0.55, (u, t) -> -3.0 .* u)
             SciMLBase.terminate!(integ)
