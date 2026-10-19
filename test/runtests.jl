@@ -10405,6 +10405,26 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test integ.u == SciMLBase.solve(prob, bdf; dt = 0.01, adaptive = false).u[end]
     end
 
+    @testset "a parameter set through integ.ps restarts the step" begin
+        kdecay!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
+        sys = SciMLBase.SymbolCache([:a], [:k], :t)
+        prob() = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(kdecay!; sys), [1.0], (0.0, 1.0), [1.0],
+        )
+        for (alg, err) in ((PETScDiffEq.TSRK("5dp"), 1.0e-6), (PETScDiffEq.TSRK("3bs"), 5.0e-4))
+            pr = prob()
+            integ = SciMLBase.init(pr, alg; dt = 0.1, adaptive = false)
+            foreach(_ -> SciMLBase.step!(integ), 1:5)
+            t1, u1 = integ.t, integ.u[1]
+            integ.ps[:k] = 2.0
+            @test integ.ps[:k] == 2.0
+            @test pr.p == [2.0]
+            # Restarted, "5dp" and "3bs" land ~3e-8 and ~9e-5 from the exact tail; a kept
+            # FSAL slope taken with k = 1 costs ~2e-3 and ~5e-3.
+            @test abs(SciMLBase.solve!(integ).u[end][1] - u1 * exp(-2 * (1 - t1))) < err
+        end
+    end
+
     @testset "a callback that clears the flag after changing u does not restart PETSc" begin
         rotate!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
         prob = SciMLBase.ODEProblem(rotate!, [1.0, 1.0], (0.0, 2.0))

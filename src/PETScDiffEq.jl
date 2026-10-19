@@ -6448,9 +6448,10 @@ The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
 `step!`, run it to the end with `solve!`, stop it early with `terminate!` and
 restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
 are readable, `integ(t)`, `integ(t, Val{1})`, `integ(t; idxs)` and `integ(out, t)` give the
-state or its slope inside the step just taken, `integ.ps[sym]` gets and sets parameters
-by symbol, and `add_tstop!` schedules a time to land on
-exactly. Assigning `u` or `t` takes effect at the next step, as `set_u!` and `set_t!` do.
+state or its slope inside the step just taken, and `add_tstop!` schedules a time to land on
+exactly. `integ.ps[sym]` gets and sets parameters by symbol, editing `p` in place, so
+`prob.p` sees writes that assigning `integ.p` would replace. Assigning `u` or `t` takes
+effect at the next step, as `set_u!` and `set_t!` do.
 
 These are in the types PETSc steps in. The clock, and so `t`, `dt` and the saved times, is
 `Float32` for a `Float32` or `ComplexF32` state with a `Float32` span and `Float64`
@@ -6529,9 +6530,16 @@ _check_continuous(cb) = throw(
     ),
 )
 
+# An FSAL method reuses its last stage's slope, taken before the change, unless restarted.
+# BDF keeps only past states, which stay valid, and a restart drops it to first order.
+_restart_step(h) =
+    h.destroyed || h.ctx.alg_name == "bdf" || LibPETSc.TSRestartStep(h.petsclib, h.ts)
+
 function _discontinuity_unlocked(integ::PETScIntegrator, bool::Bool)
     integ.derivative_discontinuity = bool
-    bool && _dirty!(integ.h.ctx)
+    bool || return nothing
+    _dirty!(integ.h.ctx)
+    _restart_step(integ.h)
     return nothing
 end
 
@@ -6543,9 +6551,7 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     h = integ.h
     h.ctx.p = integ.p
     _dirty!(h.ctx)
-    # An FSAL method reuses its last stage's slope, taken with the old p, unless restarted.
-    # BDF keeps only past states, which stay valid, and a restart drops it to first order.
-    h.destroyed || h.ctx.alg_name == "bdf" || LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    _restart_step(h)
     return v
 end
 
