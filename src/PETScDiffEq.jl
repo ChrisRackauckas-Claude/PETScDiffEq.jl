@@ -6530,16 +6530,14 @@ _check_continuous(cb) = throw(
     ),
 )
 
-# An FSAL method reuses its last stage's slope, taken before the change, unless restarted.
-# BDF keeps only past states, which stay valid, and a restart drops it to first order.
-_restart_step(h) =
-    h.destroyed || h.ctx.alg_name == "bdf" || LibPETSc.TSRestartStep(h.petsclib, h.ts)
-
 function _discontinuity_unlocked(integ::PETScIntegrator, bool::Bool)
     integ.derivative_discontinuity = bool
     bool || return nothing
-    _dirty!(integ.h.ctx)
-    _restart_step(integ.h)
+    h = integ.h
+    _dirty!(h.ctx)
+    # Whatever a method kept from the last step — an FSAL slope or BDF's history — was
+    # computed before the change, so the next step restarts.
+    h.destroyed || LibPETSc.TSRestartStep(h.petsclib, h.ts)
     return nothing
 end
 
@@ -6551,7 +6549,10 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     h = integ.h
     h.ctx.p = integ.p
     _dirty!(h.ctx)
-    _restart_step(h)
+    # An FSAL method reuses its last stage's slope, taken with the old p, unless restarted.
+    # BDF instead restarts only on a declared discontinuity, so assigning p — the same p
+    # or a changed one — does not drop it to first order.
+    h.destroyed || h.ctx.alg_name == "bdf" || LibPETSc.TSRestartStep(h.petsclib, h.ts)
     return v
 end
 

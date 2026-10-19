@@ -10411,7 +10411,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         prob() = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(kdecay!; sys), [1.0], (0.0, 1.0), [1.0],
         )
-        for (alg, err) in ((PETScDiffEq.TSRK("5dp"), 1.0e-6), (PETScDiffEq.TSRK("3bs"), 5.0e-4))
+        function run(setter, alg)
+            integ = SciMLBase.init(prob(), alg; dt = 0.1, adaptive = false)
+            foreach(_ -> SciMLBase.step!(integ), 1:5)
+            setter(integ)
+            return SciMLBase.solve!(integ).u[end][1]
+        end
+        for (alg, err) in (
+                (PETScDiffEq.TSRK("5dp"), 1.0e-6),
+                (PETScDiffEq.TSRK("3bs"), 5.0e-4),
+                (PETScDiffEq.TSImplicit("bdf", ["-ts_adapt_type", "none"]), 1.0e-3),
+            )
             pr = prob()
             integ = SciMLBase.init(pr, alg; dt = 0.1, adaptive = false)
             foreach(_ -> SciMLBase.step!(integ), 1:5)
@@ -10419,9 +10429,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             integ.ps[:k] = 2.0
             @test integ.ps[:k] == 2.0
             @test pr.p == [2.0]
-            # Restarted, "5dp" and "3bs" land ~3e-8 and ~9e-5 from the exact tail; a kept
-            # FSAL slope taken with k = 1 costs ~2e-3 and ~5e-3.
-            @test abs(SciMLBase.solve!(integ).u[end][1] - u1 * exp(-2 * (1 - t1))) < err
+            final = SciMLBase.solve!(integ).u[end][1]
+            # A stale FSAL slope or BDF history costs ~2e-3, ~5e-3 and ~1.3e-2 here; a
+            # restart lands ~3e-8, ~9e-5 and ~8e-5 from the exact tail.
+            @test abs(final - u1 * exp(-2 * (1 - t1))) < err
+            # Writing p in place and setting the flag directly takes the same path.
+            @test final ==
+                run(i -> (i.p[1] = 2.0; SciMLBase.derivative_discontinuity!(i, true)), alg)
+        end
+        # `integ.p =` restarts these methods too, so it lands on the same value.
+        for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs"))
+            @test run(i -> (i.ps[:k] = 2.0), alg) == run(i -> (i.p = [2.0]), alg)
         end
     end
 
